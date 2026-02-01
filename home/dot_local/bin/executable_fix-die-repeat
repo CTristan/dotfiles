@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+#
+# fix-die-repeat.sh - Automated check, review, and fix loop using pi
+#
+# Workflow:
+# 1. Run check command (output to .fix-die-repeat/checks.log)
+# 2. Check status:
+#    2A. If failed: Run pi with checks.log to fix errors, then loop back to 1
+#    2B. If passed: Continue to step 3
+# 3. Prepare review artifacts (preserve .fix-die-repeat/review.md, clear .fix-die-repeat/review_current.md)
+# 4. Collect changed/staged files
+# 5. Run pi to review files (output to .fix-die-repeat/review_current.md, include .fix-die-repeat/review.md context)
+# 6. Check review results:
+#    6A. If issues found: Run pi with .fix-die-repeat/review_current.md to fix them, then loop back to 1
+#    6B. If no issues: Success
+# 7. Done (cleanup .fix-die-repeat/review_current.md only; .fix-die-repeat/review.md retained)
+#
+# Environment:
+#   FDR_CHECK_CMD  - Command to run checks (default: ./scripts/ci-gate.sh)
+#   FDR_MAX_ITERS  - Maximum loop iterations (default: 10)
+#
+
+set -euo pipefail
+
+FDR_CHECK_CMD="${FDR_CHECK_CMD:-./scripts/ci-gate.sh}"
+FDR_MAX_ITERS="${FDR_MAX_ITERS:-10}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+FDR_DIR="$PROJECT_ROOT/.fix-die-repeat"
+REVIEW_FILE="$FDR_DIR/review.md"
+REVIEW_CURRENT_FILE="$FDR_DIR/review_current.md"
+CHECKS_LOG="$FDR_DIR/checks.log"
+PI_LOG="$FDR_DIR/pi.log"
+
+iteration=0
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [fdr] $*"
+}
+
+error() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [fdr] ERROR: $*" >&2
+}
+
+format_duration() {
+    local total_seconds=$1
+    local hours=$((total_seconds / 3600))
+    local minutes=$(((total_seconds % 3600) / 60))
+    local seconds=$((total_seconds % 60))
+
+    if [[ $hours -gt 0 ]]; then
+        printf "%dh %dm %ds" "$hours" "$minutes" "$seconds"
+    elif [[ $minutes -gt 0 ]]; then
+        printf "%dm %ds" "$minutes" "$seconds"
+    else
+        printf "%ds" "$seconds"
+    fi
+}
+
+# Cleanup and logging on unexpected exit
+cleanup() {
+    local exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        error "Script exited unexpectedly with code $exit_code at iteration $iteration"
+        if [[ -f "$PI_LOG" ]] && [[ -s "$PI_LOG" ]]; then
+            error "=== Last 30 lines of pi.log ==="
+            tail -30 "$PI_LOG" >&2
+            error "=== End of pi.log excerpt ==="
+        fi
+    fi
+}
+trap cleanup EXIT
+
+# Run pi with logging - captures exit code and logs failures
+run_pi() {
+    local exit_code=0
+    # Run pi, capturing stderr to log file while still showing stdout
+    if ! pi "$@" 2> >(tee -a "$PI_LOG" >&2); then
+        exit_code=$?
+        error "pi exited with code $exit_code"
+        error "pi stderr logged to: $PI_LOG"
+        if [[ -f "$PI_LOG" ]]; then
+            error "Last 20 lines of pi.log:"
+            tail -20 "$PI_LOG" >&2
+        fi
+        return $exit_code
+    fi
+    return 0
+}
+
+get_changed_files() {
+    # Get both staged and unstaged changed files, deduplicate, filter to existing files only
+    {
+        git diff --name-only 2>/dev/null || true
+        git diff --cached --name-only 2>/dev/null || true
+    } | sort -u | while IFS= read -r file; do
+        # Only include files that exist (exclude deleted files and .fix-die-repeat directory)
+        if [[ -f "$PROJECT_ROOT/$file" ]] && [[ "$file" != .fix-die-repeat/* ]]; then
+            echo "$file"
+        fi
+    done
+}
+
+append_review_entry() {
+    local timestamp
+    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    {
+        echo "## Iteration $iteration - Review ($timestamp)"
+        if [[ -s "$REVIEW_CURRENT_FILE" ]]; then
+            cat "$REVIEW_CURRENT_FILE"
+        else
+            echo "_No issues found._"
+        fi
+        echo
+    } >> "$REVIEW_FILE"
+}
+
+append_resolution_entry() {
+    local message="$1"
+    local timestamp
+    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    {
+        echo "### Iteration $iteration - Resolution ($timestamp)"
+        echo "- $message"
+        echo
+    } >> "$REVIEW_FILE"
+}
+
+main() {
+    cd "$PROJECT_ROOT"
+
+    # Ensure .fix-die-repeat directory exists
+    mkdir -p "$FDR_DIR"
+
+    # Clear pi.log at start of run
+    > "$PI_LOG"
+    log "Logging pi stderr to: $PI_LOG"
+
+    while true; do
+        iteration=$((iteration + 1))
+        log "===== Iteration $iteration of $FDR_MAX_ITERS ====="
+
+        if [[ $iteration -gt $FDR_MAX_ITERS ]]; then
+            error "Maximum iterations ($FDR_MAX_ITERS) exceeded. Could not resolve all issues."
+            exit 1
+        fi
+
+        # Step 1: Run checks
+        log "[Step 1] Running ${FDR_CHECK_CMD} (output: checks.log)..."
+        checks_start_time=$(date +%s)
+        if ${FDR_CHECK_CMD} > "$CHECKS_LOG" 2>&1; then
+            checks_status=0
+        else
+            checks_status=$?
+        fi
+        checks_end_time=$(date +%s)
+        checks_duration=$((checks_end_time - checks_start_time))
+        log "[Step 1] run_checks duration: $(format_duration "$checks_duration")"
+
+        if [[ $checks_status -eq 0 ]]; then
+            log "[Step 2B] Checks passed. Proceeding to review."
+        else
+            log "[Step 2A] Checks failed. Running pi to fix errors..."
+            run_pi -p @.fix-die-repeat/checks.log "The file .fix-die-repeat/checks.log contains the initial failure output from running ${FDR_CHECK_CMD}. Fix the errors shown in the log. IMPORTANT: After applying fixes, you MUST run ${FDR_CHECK_CMD} (or the specific relevant commands) yourself to verify the fixes work. Do not exit until you have verified that the checks pass."
+            continue
+        fi
+
+        # Step 3: Prepare review artifacts
+        log "[Step 3] Preparing review artifacts..."
+        if [[ ! -f "$REVIEW_FILE" ]]; then
+            touch "$REVIEW_FILE"
+        fi
+        if [[ -f "$REVIEW_CURRENT_FILE" ]]; then
+            rm "$REVIEW_CURRENT_FILE"
+        fi
+
+        # Step 4: Collect files
+        log "[Step 4] Collecting changed and staged files..."
+        changed_files=()
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && changed_files+=("$line")
+        done < <(get_changed_files)
+
+        if [[ ${#changed_files[@]} -eq 0 ]]; then
+            error "No changed or staged files found. Nothing to review."
+            exit 1
+        fi
+
+        log "[Step 4] Found ${#changed_files[@]} file(s) to review"
+
+        # Step 5: Run pi review
+        log "[Step 5] Running pi to review files..."
+        pi_args=("-p")
+        for f in "${changed_files[@]}"; do
+            pi_args+=("@$f")
+        done
+        if [[ -f "$REVIEW_FILE" ]]; then
+            pi_args+=("@$REVIEW_FILE")
+        fi
+
+        run_pi "${pi_args[@]}" "Review all of the provided files for issues (bugs, security problems, code quality issues, etc.). Use .fix-die-repeat/review.md as historical context so resolved items are not re-reported unless they regress. If you find any new issues, you MUST use the 'write' tool to save them to '.fix-die-repeat/review_current.md' in the project root. If you find NO issues, you MUST still use the 'write' tool to create an empty file named '.fix-die-repeat/review_current.md' in the project root."
+        append_review_entry
+
+        # Step 6: Analyze review results
+        if [[ ! -f "$REVIEW_CURRENT_FILE" ]]; then
+            error ".fix-die-repeat/review_current.md was not created by pi. This is unexpected."
+            exit 1
+        fi
+
+        if [[ -s "$REVIEW_CURRENT_FILE" ]]; then
+            log "[Step 6A] Issues found in .fix-die-repeat/review_current.md. Running pi to fix them..."
+            run_pi -p "@$REVIEW_CURRENT_FILE" "Fix all issues documented in .fix-die-repeat/review_current.md. Address each issue mentioned in the file. IMPORTANT: After applying fixes, run ${FDR_CHECK_CMD} (or relevant tests) to ensure your changes didn't break the build or existing functionality."
+            append_resolution_entry "Fixes applied for .fix-die-repeat/review_current.md; verification pending."
+            continue
+        else
+        log "[Step 6B] No issues found in .fix-die-repeat/review_current.md."
+            append_resolution_entry "No issues found."
+        fi
+
+        # Step 7: Done
+        if [[ -f "$REVIEW_CURRENT_FILE" ]]; then
+            rm "$REVIEW_CURRENT_FILE"
+        fi
+        log "[Step 7] Done! All checks passed and no review issues found. .fix-die-repeat/review.md retained."
+        exit 0
+    done
+}
+
+main "$@"
