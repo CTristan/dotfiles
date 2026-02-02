@@ -24,6 +24,7 @@ set -euo pipefail
 
 FDR_CHECK_CMD="${FDR_CHECK_CMD:-./scripts/ci-gate.sh}"
 FDR_MAX_ITERS="${FDR_MAX_ITERS:-10}"
+FDR_CLEAR_ARTIFACTS="${FDR_CLEAR_ARTIFACTS:-0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 FDR_DIR="$PROJECT_ROOT/.fix-die-repeat"
@@ -131,6 +132,11 @@ main() {
 
     # Ensure .fix-die-repeat directory exists
     mkdir -p "$FDR_DIR"
+
+    if [[ "$FDR_CLEAR_ARTIFACTS" == "1" || "$FDR_CLEAR_ARTIFACTS" == "true" ]]; then
+        log "Clearing existing artifacts in $FDR_DIR"
+        find "$FDR_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+    fi
 
     # Clear pi.log at start of run
     > "$PI_LOG"
