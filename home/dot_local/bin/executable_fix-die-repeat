@@ -134,8 +134,8 @@ main() {
     mkdir -p "$FDR_DIR"
 
     if [[ "$FDR_CLEAR_ARTIFACTS" == "1" || "$FDR_CLEAR_ARTIFACTS" == "true" ]]; then
-        log "Clearing existing artifacts in $FDR_DIR"
-        find "$FDR_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+        log "Clearing existing .log and .md artifacts in $FDR_DIR"
+        find "$FDR_DIR" -mindepth 1 -maxdepth 1 -type f \( -name "*.log" -o -name "*.md" \) -exec rm -f -- {} +
     fi
 
     # Clear pi.log at start of run
