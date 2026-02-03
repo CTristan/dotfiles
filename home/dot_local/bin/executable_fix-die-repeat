@@ -25,6 +25,7 @@ set -euo pipefail
 FDR_CHECK_CMD="${FDR_CHECK_CMD:-./scripts/ci-gate.sh}"
 FDR_MAX_ITERS="${FDR_MAX_ITERS:-10}"
 FDR_CLEAR_ARTIFACTS="${FDR_CLEAR_ARTIFACTS:-0}"
+FDR_PR_REVIEW="${FDR_PR_REVIEW:-0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 FDR_DIR="$PROJECT_ROOT/.fix-die-repeat"
@@ -71,6 +72,110 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
+
+# Fetch PR threads and format them for the agent
+fetch_pr_threads() {
+    local branch
+    branch=$(git branch --show-current)
+
+    if [[ -z "$branch" ]]; then
+        error "Not on a git branch. Skipping PR review."
+        return 0
+    fi
+
+    log "Fetching PR info for branch: $branch"
+
+    # Check gh auth
+    if ! gh auth status >/dev/null 2>&1; then
+        error "GitHub CLI not authenticated. Skipping PR review."
+        return 0
+    fi
+
+    # Get PR info
+    local pr_json
+    if ! pr_json=$(gh pr view "$branch" --json number,url,headRepository,headRepositoryOwner 2>/dev/null); then
+        log "No open PR found for $branch or error fetching PR. Skipping PR review."
+        return 0
+    fi
+
+    local pr_number pr_url repo_owner repo_name
+    pr_number=$(echo "$pr_json" | jq -r .number)
+    pr_url=$(echo "$pr_json" | jq -r .url)
+    repo_owner=$(echo "$pr_json" | jq -r .headRepositoryOwner.login)
+    repo_name=$(echo "$pr_json" | jq -r .headRepository.name)
+
+    log "Found PR #$pr_number ($pr_url). Fetching threads..."
+
+    # GraphQL query to get unresolved threads
+    local query='
+      query($owner: String!, $repo: String!, $number: Int!) {
+        repository(owner: $owner, name: $repo) {
+          pullRequest(number: $number) {
+            reviewThreads(first: 100) {
+              nodes {
+                isResolved
+                id
+                path
+                line
+                comments(first: 10) {
+                  nodes {
+                    author { login }
+                    body
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    '
+
+    local gql_result
+    if ! gql_result=$(gh api graphql -f query="$query" -F owner="$repo_owner" -F repo="$repo_name" -F number="$pr_number"); then
+        error "Failed to fetch threads via GraphQL."
+        return 0
+    fi
+
+    # Parse and format threads using jq
+    # We filter for !isResolved and format the output
+    local threads_output
+    threads_output=$(echo "$gql_result" | jq -r '
+        .data.repository.pullRequest.reviewThreads.nodes
+        | map(select(.isResolved == false))
+        | to_entries
+        | map(
+            "--- Thread #\(.key + 1) ---\n" +
+            "ID: \(.value.id)\n" +
+            "File: \(.value.path)\n" +
+            (if .value.line then "Line: \(.value.line)\n" else "" end) +
+            (.value.comments.nodes | map("[\(.author.login // "unknown")]: \(.body)") | join("\n")) +
+            "\n"
+          )
+        | join("\n")
+    ')
+
+    if [[ -n "$threads_output" ]]; then
+        local count
+        count=$(echo "$gql_result" | jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length')
+
+        {
+            echo "I'\''ve found $count unresolved review threads on PR #$pr_number ($pr_url)."
+            echo ""
+            echo "Please review each thread, check the associated code, and determine if a fix is required."
+            echo "If a fix is needed, apply it. If not, explain why."
+            echo "CRITICAL: If you fix these issues, you MUST use the 'resolve_pr_threads' tool to mark them resolved on GitHub."
+            echo "If you determine a fix is not required, you MUST use the 'reply_to_thread' tool to explain why."
+            echo ""
+            echo "$threads_output"
+        } > "$REVIEW_CURRENT_FILE"
+
+        log "Found $count unresolved threads. Added to review queue."
+        return 0
+    else
+        log "No unresolved threads found."
+        return 0
+    fi
+}
 
 # Run pi with logging - captures exit code and logs failures
 run_pi() {
@@ -180,32 +285,46 @@ main() {
             rm "$REVIEW_CURRENT_FILE"
         fi
 
-        # Step 4: Collect files
-        log "[Step 4] Collecting changed and staged files..."
-        changed_files=()
-        while IFS= read -r line; do
-            [[ -n "$line" ]] && changed_files+=("$line")
-        done < <(get_changed_files)
-
-        if [[ ${#changed_files[@]} -eq 0 ]]; then
-            error "No changed or staged files found. Nothing to review."
-            exit 1
+        # Step 3.5: Check PR threads if enabled
+        if [[ "$FDR_PR_REVIEW" == "1" ]]; then
+            log "[Step 3.5] Checking for unresolved PR threads..."
+            fetch_pr_threads
+            # Disable PR review for subsequent iterations
+            FDR_PR_REVIEW=0
         fi
 
-        log "[Step 4] Found ${#changed_files[@]} file(s) to review"
+        # Skip local review if we have PR threads to process
+        if [[ -s "$REVIEW_CURRENT_FILE" ]]; then
+            log "[Step 4] Using PR threads from $REVIEW_CURRENT_FILE for review."
+            log "[Step 5] Skipping local file review generation."
+        else
+            # Step 4: Collect files
+            log "[Step 4] Collecting changed and staged files..."
+            changed_files=()
+            while IFS= read -r line; do
+                [[ -n "$line" ]] && changed_files+=("$line")
+            done < <(get_changed_files)
 
-        # Step 5: Run pi review
-        log "[Step 5] Running pi to review files..."
-        pi_args=("-p")
-        for f in "${changed_files[@]}"; do
-            pi_args+=("@$f")
-        done
-        if [[ -f "$REVIEW_FILE" ]]; then
-            pi_args+=("@$REVIEW_FILE")
+            if [[ ${#changed_files[@]} -eq 0 ]]; then
+                error "No changed or staged files found. Nothing to review."
+                exit 1
+            fi
+
+            log "[Step 4] Found ${#changed_files[@]} file(s) to review"
+
+            # Step 5: Run pi review
+            log "[Step 5] Running pi to review files..."
+            pi_args=("-p")
+            for f in "${changed_files[@]}"; do
+                pi_args+=("@$f")
+            done
+            if [[ -f "$REVIEW_FILE" ]]; then
+                pi_args+=("@$REVIEW_FILE")
+            fi
+
+            run_pi "${pi_args[@]}" "Review all of the provided files for issues (bugs, security problems, code quality issues, etc.). Use .fix-die-repeat/review.md as historical context so resolved items are not re-reported unless they regress. If you find any new issues, you MUST use the 'write' tool to save them to '.fix-die-repeat/review_current.md' in the project root. If you find NO issues, you MUST still use the 'write' tool to create an empty file named '.fix-die-repeat/review_current.md' in the project root."
+            append_review_entry
         fi
-
-        run_pi "${pi_args[@]}" "Review all of the provided files for issues (bugs, security problems, code quality issues, etc.). Use .fix-die-repeat/review.md as historical context so resolved items are not re-reported unless they regress. If you find any new issues, you MUST use the 'write' tool to save them to '.fix-die-repeat/review_current.md' in the project root. If you find NO issues, you MUST still use the 'write' tool to create an empty file named '.fix-die-repeat/review_current.md' in the project root."
-        append_review_entry
 
         # Step 6: Analyze review results
         if [[ ! -f "$REVIEW_CURRENT_FILE" ]]; then
@@ -215,7 +334,7 @@ main() {
 
         if [[ -s "$REVIEW_CURRENT_FILE" ]]; then
             log "[Step 6A] Issues found in .fix-die-repeat/review_current.md. Running pi to fix them..."
-            run_pi -p "@$REVIEW_CURRENT_FILE" "Fix all issues documented in .fix-die-repeat/review_current.md. Address each issue mentioned in the file. IMPORTANT: After applying fixes, run ${FDR_CHECK_CMD} (or relevant tests) to ensure your changes didn't break the build or existing functionality."
+            run_pi -p "@$REVIEW_CURRENT_FILE" "Fix all issues documented in .fix-die-repeat/review_current.md. Address each issue mentioned in the file. IMPORTANT: After applying fixes, run ${FDR_CHECK_CMD} (or relevant tests) to ensure your changes didn't break the build or existing functionality. If these issues are PR threads (indicated by 'Thread #ID'), use the 'resolve_pr_threads' tool to mark them resolved on GitHub after fixing."
             append_resolution_entry "Fixes applied for .fix-die-repeat/review_current.md; verification pending."
             continue
         else
