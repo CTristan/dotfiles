@@ -337,7 +337,13 @@ main() {
 
         if [[ -s "$REVIEW_CURRENT_FILE" ]]; then
             log "[Step 6A] Issues found in .fix-die-repeat/review_current.md. Running pi to fix them..."
-            run_pi -p "@$REVIEW_CURRENT_FILE" "Fix all issues documented in .fix-die-repeat/review_current.md. Address each issue mentioned in the file. IMPORTANT: After applying fixes, run ${FDR_CHECK_CMD} (or relevant tests) to ensure your changes didn't break the build or existing functionality. If these issues are PR threads (indicated by 'Thread #ID'), use the 'resolve_pr_threads' tool to mark them resolved on GitHub after fixing."
+
+            fix_args=("-p" "@$REVIEW_CURRENT_FILE")
+            if [[ -f "$REVIEW_FILE" ]]; then
+                fix_args+=("@$REVIEW_FILE")
+            fi
+
+            run_pi "${fix_args[@]}" "Fix all issues documented in .fix-die-repeat/review_current.md. Address each issue mentioned in the file. IMPORTANT: After applying fixes, you MUST verify that the specific issues are actually resolved (e.g., by adding/running a test case) AND run ${FDR_CHECK_CMD} (or relevant tests) to ensure your changes didn't break the build or existing functionality. Also ensure that your changes do not re-surface older issues listed in .fix-die-repeat/review.md. If these issues are PR threads (indicated by 'Thread #ID'), use the 'resolve_pr_threads' tool to mark them resolved on GitHub ONLY after verifying the fix."
             append_resolution_entry "Fixes applied for .fix-die-repeat/review_current.md; verification pending."
             continue
         else
