@@ -159,12 +159,14 @@ fetch_pr_threads() {
         count=$(echo "$gql_result" | jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length')
 
         {
-            echo "I'\''ve found $count unresolved review threads on PR #$pr_number ($pr_url)."
+            echo "I've found $count unresolved review threads on PR #$pr_number ($pr_url)."
             echo ""
             echo "Please review each thread, check the associated code, and determine if a fix is required."
             echo "If a fix is needed, apply it. If not, explain why."
-            echo "CRITICAL: If you fix these issues, you MUST use the 'resolve_pr_threads' tool to mark them resolved on GitHub."
-            echo "If you determine a fix is not required, you MUST use the 'reply_to_thread' tool to explain why."
+            echo ""
+            echo "CRITICAL: For each thread below, the 'ID' is the GraphQL thread ID. You MUST use this ID with the available tools:"
+            echo " - To resolve a thread after fixing: use 'resolve_pr_threads(threadIds: [\"ID_HERE\"])'"
+            echo " - To reply to a thread (e.g. to explain a 'won't fix'): use 'reply_to_thread(threadId: \"ID_HERE\", body: \"...\")'"
             echo ""
             echo "$threads_output"
         } > "$REVIEW_CURRENT_FILE"
@@ -323,8 +325,9 @@ main() {
             fi
 
             run_pi "${pi_args[@]}" "Review all of the provided files for issues (bugs, security problems, code quality issues, etc.). Use .fix-die-repeat/review.md as historical context so resolved items are not re-reported unless they regress. If you find any new issues, you MUST use the 'write' tool to save them to '.fix-die-repeat/review_current.md' in the project root. If you find NO issues, you MUST still use the 'write' tool to create an empty file named '.fix-die-repeat/review_current.md' in the project root."
-            append_review_entry
         fi
+
+        append_review_entry
 
         # Step 6: Analyze review results
         if [[ ! -f "$REVIEW_CURRENT_FILE" ]]; then
