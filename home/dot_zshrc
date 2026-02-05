@@ -27,6 +27,11 @@ source "$ZSH/oh-my-zsh.sh"
 # Ensure personal scripts are available globally
 export PATH="$HOME/.local/bin:$PATH"
 
+# --- Brave Search ---
+if [ -f "$HOME/.config/brave-search/env.sh" ]; then
+  . "$HOME/.config/brave-search/env.sh"
+fi
+
 # --- Docker ---
 fpath=("$HOME/.docker/completions" $fpath)
 
