@@ -16,13 +16,13 @@
 # 7. Done (cleanup .fix-die-repeat/review_current.md only; .fix-die-repeat/review.md retained)
 #
 # Environment:
-#   FDR_CHECK_CMD  - Command to run checks (default: ./scripts/ci-gate.sh)
+#   FDR_CHECK_CMD  - Command to run checks (default: ./scripts/ci.sh)
 #   FDR_MAX_ITERS  - Maximum loop iterations (default: 10)
 #
 
 set -euo pipefail
 
-FDR_CHECK_CMD="${FDR_CHECK_CMD:-./scripts/ci-gate.sh}"
+FDR_CHECK_CMD="${FDR_CHECK_CMD:-./scripts/ci.sh}"
 FDR_MAX_ITERS="${FDR_MAX_ITERS:-10}"
 FDR_CLEAR_ARTIFACTS="${FDR_CLEAR_ARTIFACTS:-0}"
 FDR_PR_REVIEW="${FDR_PR_REVIEW:-0}"
