@@ -324,7 +324,7 @@ main() {
                 pi_args+=("@$REVIEW_FILE")
             fi
 
-            run_pi "${pi_args[@]}" "Review all of the provided files for issues (bugs, security problems, code quality issues, etc.). Use .fix-die-repeat/review.md as historical context so resolved items are not re-reported unless they regress. If you find any new issues, you MUST use the 'write' tool to save them to '.fix-die-repeat/review_current.md' in the project root. If you find NO issues, you MUST still use the 'write' tool to create an empty file named '.fix-die-repeat/review_current.md' in the project root."
+            run_pi "${pi_args[@]}" "Review all of the provided files for issues (bugs, security problems, code quality issues, etc.). Use .fix-die-repeat/review.md as historical context so resolved items are not re-reported unless they regress. Your task is ONLY to identify and document issues. Do NOT fix them yourself. If you find any new issues, you MUST use the 'write' tool to save them to '.fix-die-repeat/review_current.md' in the project root. If you find NO issues, you MUST still use the 'write' tool to create an empty file named '.fix-die-repeat/review_current.md' in the project root."
         fi
 
         append_review_entry
