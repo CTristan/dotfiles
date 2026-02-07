@@ -29,10 +29,12 @@ PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 FDR_DIR="$PROJECT_ROOT/.fix-die-repeat"
 REVIEW_FILE="$FDR_DIR/review.md"
 REVIEW_CURRENT_FILE="$FDR_DIR/review_current.md"
+BUILD_HISTORY_FILE="$FDR_DIR/build_history.md"
 CHECKS_LOG="$FDR_DIR/checks.log"
 PI_LOG="$FDR_DIR/pi.log"
 
 iteration=0
+PREV_CHECKS_HASH=""
 
 usage() {
     echo "Usage: $(basename "$0") [OPTIONS]"
@@ -325,11 +327,64 @@ main() {
         checks_duration=$((checks_end_time - checks_start_time))
         log "[Step 1] run_checks duration: $(format_duration "$checks_duration")"
 
+        # Check for repeated failures to prevent loops
+        current_checks_hash=$(git hash-object "$CHECKS_LOG" 2>/dev/null || echo "iteration_$iteration")
+        repeated_failure_warning=""
+
+        if [[ "$checks_status" -ne 0 ]]; then
+             if [[ "$current_checks_hash" == "$PREV_CHECKS_HASH" ]]; then
+                 repeated_failure_warning="WARNING: The check output is IDENTICAL to the previous iteration. Your last fix did NOT work. You must try a DIFFERENT approach."
+                 log "Detected identical check output. Adding warning to prompt."
+             fi
+        fi
+        PREV_CHECKS_HASH="$current_checks_hash"
+
         if [[ $checks_status -eq 0 ]]; then
             log "[Step 2B] Checks passed. Proceeding to review."
         else
             log "[Step 2A] Checks failed. Running pi to fix errors..."
-            run_pi -p @.fix-die-repeat/checks.log "The file .fix-die-repeat/checks.log contains the initial failure output from running ${FDR_CHECK_CMD}. Fix the errors shown in the log. IMPORTANT: After applying fixes, you MUST run ${FDR_CHECK_CMD} (or the specific relevant commands) yourself to verify the fixes work. Do not exit until you have verified that the checks pass."
+
+            # Collect files to context
+            changed_files=()
+            while IFS= read -r line; do
+                [[ -n "$line" ]] && changed_files+=("$line")
+            done < <(get_changed_files)
+
+            # Construct args for fix step
+            fix_checks_args=("-p" "@$CHECKS_LOG")
+            if [[ -f "$REVIEW_FILE" ]]; then
+                fix_checks_args+=("@$REVIEW_FILE")
+            fi
+            if [[ -f "$BUILD_HISTORY_FILE" ]]; then
+                fix_checks_args+=("@$BUILD_HISTORY_FILE")
+            fi
+            for f in "${changed_files[@]}"; do
+                fix_checks_args+=("@$f")
+            done
+
+            # Construct prompt for fix step
+            fix_checks_prompt="The file .fix-die-repeat/checks.log contains the failure output from ${FDR_CHECK_CMD}. "
+            if [[ -n "$repeated_failure_warning" ]]; then
+                fix_checks_prompt+="$repeated_failure_warning "
+            fi
+            if [[ -f "$REVIEW_FILE" ]]; then
+                 fix_checks_prompt+="I have attached .fix-die-repeat/review.md which contains history of previous iterations. Review it to avoid repeating mistakes. "
+            fi
+            if [[ -f "$BUILD_HISTORY_FILE" ]]; then
+                 fix_checks_prompt+="I have attached .fix-die-repeat/build_history.md which contains a summary of files you modified in previous attempts to fix the build. Use this to avoid repeating ineffective changes. "
+            fi
+            fix_checks_prompt+="I have also attached the currently changed files for context. "
+            fix_checks_prompt+="Your goal is to FIX the errors. Follow this plan:\n1. ANALYZE the log and identify the root cause.\n2. PLAN your fix.\n3. APPLY the fix using 'edit'.\n4. VERIFY the fix by running the relevant command locally (using 'bash').\nDo not exit until you have verified the fix works."
+
+            run_pi "${fix_checks_args[@]}" "$fix_checks_prompt"
+
+            # Record history
+            {
+                echo "## Iteration $iteration Fixes"
+                git diff --stat
+                echo ""
+            } >> "$BUILD_HISTORY_FILE"
+
             continue
         fi
 
@@ -379,7 +434,20 @@ main() {
                 pi_args+=("@$REVIEW_FILE")
             fi
 
-            run_pi "${pi_args[@]}" "Review all of the provided files for issues (bugs, security problems, code quality issues, etc.). Use .fix-die-repeat/review.md as historical context so resolved items are not re-reported unless they regress. Your task is ONLY to identify and document issues. Do NOT fix them yourself. If you find any new issues, you MUST use the 'write' tool to save them to '.fix-die-repeat/review_current.md' in the project root. If you find NO issues, you MUST still use the 'write' tool to create an empty file named '.fix-die-repeat/review_current.md' in the project root."
+            run_pi "${pi_args[@]}" "Review all of the provided files for issues. Use .fix-die-repeat/review.md as historical context.
+Your task is ONLY to identify and document issues. Do NOT fix them yourself.
+
+Classify issues as:
+- [CRITICAL]: Bugs, security flaws, compilation errors, broken logic.
+- [NIT]: Style issues, minor optimizations, comments, formatting.
+
+IMPORTANT:
+1. ONLY report [NIT] issues if you also find [CRITICAL] issues.
+2. If you only find [NIT] issues, report 'No critical issues found' and create an empty .fix-die-repeat/review_current.md.
+3. If you find [CRITICAL] issues, report BOTH [CRITICAL] and [NIT] issues.
+
+If you find reportable issues, use the 'write' tool to save them to '.fix-die-repeat/review_current.md' in the project root.
+If you find NO reportable issues, use the 'write' tool to create an empty file named '.fix-die-repeat/review_current.md' in the project root."
         fi
 
         append_review_entry
@@ -398,7 +466,17 @@ main() {
                 fix_args+=("@$REVIEW_FILE")
             fi
 
-            run_pi "${fix_args[@]}" "Fix all issues documented in .fix-die-repeat/review_current.md. Address each issue mentioned in the file. IMPORTANT: After applying fixes, you MUST verify that the specific issues are actually resolved (e.g., by adding/running a test case) AND run ${FDR_CHECK_CMD} (or relevant tests) to ensure your changes didn't break the build or existing functionality. Also ensure that your changes do not re-surface older issues listed in .fix-die-repeat/review.md. If these issues are PR threads (indicated by 'Thread #ID'), use the 'resolve_pr_threads' tool to mark them resolved on GitHub ONLY after verifying the fix."
+            run_pi "${fix_args[@]}" "Fix all issues documented in .fix-die-repeat/review_current.md. Address each issue mentioned in the file.
+
+Follow this plan:
+1. READ the issues in .fix-die-repeat/review_current.md.
+2. PLAN your fixes.
+3. If an issue is a logic bug, CREATE a unit test to prevent regression.
+4. APPLY the fixes using 'edit'.
+5. VERIFY the fixes. Run ${FDR_CHECK_CMD} (or relevant tests) to ensure your changes didn't break the build and new tests pass.
+
+Ensure that your changes do not re-surface older issues listed in .fix-die-repeat/review.md.
+If these issues are PR threads (indicated by 'Thread #ID'), use the 'resolve_pr_threads' tool to mark them resolved on GitHub ONLY after verifying the fix."
             append_resolution_entry "Fixes applied for .fix-die-repeat/review_current.md; verification pending."
             continue
         else
