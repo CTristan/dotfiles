@@ -2,30 +2,28 @@
 #
 # fix-die-repeat.sh - Automated check, review, and fix loop using pi
 #
-# Workflow:
-# 1. Run check command (output to .fix-die-repeat/checks.log)
-# 2. Check status:
-#    2A. If failed: Run pi with checks.log to fix errors, then loop back to 1
-#    2B. If passed: Continue to step 3
-# 3. Prepare review artifacts (preserve .fix-die-repeat/review.md, clear .fix-die-repeat/review_current.md)
-# 4. Collect changed/staged files
-# 5. Run pi to review files (output to .fix-die-repeat/review_current.md, include .fix-die-repeat/review.md context)
-# 6. Check review results:
-#    6A. If issues found: Run pi with .fix-die-repeat/review_current.md to fix them, then loop back to 1
-#    6B. If no issues: Success
-# 7. Done (cleanup .fix-die-repeat/review_current.md only; .fix-die-repeat/review.md retained)
+# Usage: fix-die-repeat [OPTIONS]
 #
-# Environment:
-#   FDR_CHECK_CMD  - Command to run checks (default: ./scripts/ci.sh)
-#   FDR_MAX_ITERS  - Maximum loop iterations (default: 10)
+# Options:
+#   -c, --check-cmd CMD      Command to run checks (default: ./scripts/ci.sh)
+#   -n, --max-iters N        Maximum loop iterations (default: 10)
+#       --clear-artifacts    Clear existing artifacts before starting
+#       --pr-review          Enable PR review mode
+#   -h, --help               Show this help message
+#
+# Environment variables:
+#   FDR_CHECK_CMD, FDR_MAX_ITERS, FDR_CLEAR_ARTIFACTS, FDR_PR_REVIEW
 #
 
 set -euo pipefail
 
+# Defaults (can be overridden by env vars)
 FDR_CHECK_CMD="${FDR_CHECK_CMD:-./scripts/ci.sh}"
 FDR_MAX_ITERS="${FDR_MAX_ITERS:-10}"
 FDR_CLEAR_ARTIFACTS="${FDR_CLEAR_ARTIFACTS:-0}"
 FDR_PR_REVIEW="${FDR_PR_REVIEW:-0}"
+
+# Paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 FDR_DIR="$PROJECT_ROOT/.fix-die-repeat"
@@ -35,6 +33,20 @@ CHECKS_LOG="$FDR_DIR/checks.log"
 PI_LOG="$FDR_DIR/pi.log"
 
 iteration=0
+
+usage() {
+    echo "Usage: $(basename "$0") [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  -c, --check-cmd CMD      Command to run checks (default: ./scripts/ci.sh)"
+    echo "  -n, --max-iters N        Maximum loop iterations (default: 10)"
+    echo "      --clear-artifacts    Clear existing artifacts before starting"
+    echo "      --pr-review          Enable PR review mode"
+    echo "  -h, --help               Show this help message"
+    echo ""
+    echo "Environment variables can also be used:"
+    echo "  FDR_CHECK_CMD, FDR_MAX_ITERS, FDR_CLEAR_ARTIFACTS, FDR_PR_REVIEW"
+}
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [fdr] $*"
@@ -235,6 +247,49 @@ append_resolution_entry() {
 }
 
 main() {
+    # Argument parsing
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -c|--check-cmd)
+                if [[ -n "${2:-}" && ! "$2" =~ ^- ]]; then
+                    FDR_CHECK_CMD="$2"
+                    shift 2
+                else
+                    error "Argument for $1 is missing"
+                    usage
+                    exit 1
+                fi
+                ;;
+            -n|--max-iters)
+                if [[ -n "${2:-}" && ! "$2" =~ ^- ]]; then
+                    FDR_MAX_ITERS="$2"
+                    shift 2
+                else
+                    error "Argument for $1 is missing"
+                    usage
+                    exit 1
+                fi
+                ;;
+            --clear-artifacts)
+                FDR_CLEAR_ARTIFACTS=1
+                shift
+                ;;
+            --pr-review)
+                FDR_PR_REVIEW=1
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
+
     cd "$PROJECT_ROOT"
 
     # Ensure .fix-die-repeat directory exists
