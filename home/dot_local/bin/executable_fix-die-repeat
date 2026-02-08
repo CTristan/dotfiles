@@ -7,13 +7,13 @@
 # Options:
 #   -c, --check-cmd CMD      Command to run checks (default: ./scripts/ci.sh)
 #   -n, --max-iters N        Maximum loop iterations (default: 10)
-#       --clear-artifacts    Clear existing artifacts before starting
+#       --archive-artifacts  Archive existing artifacts to a timestamped folder
 #       --no-compact         Skip automatic compaction of large artifacts
 #       --pr-review          Enable PR review mode
 #   -h, --help               Show this help message
 #
 # Environment variables:
-#   FDR_CHECK_CMD, FDR_MAX_ITERS, FDR_CLEAR_ARTIFACTS, FDR_COMPACT_ARTIFACTS, FDR_PR_REVIEW
+#   FDR_CHECK_CMD, FDR_MAX_ITERS, FDR_ARCHIVE_ARTIFACTS, FDR_COMPACT_ARTIFACTS, FDR_PR_REVIEW
 #
 
 set -euo pipefail
@@ -21,7 +21,7 @@ set -euo pipefail
 # Defaults (can be overridden by env vars)
 FDR_CHECK_CMD="${FDR_CHECK_CMD:-./scripts/ci.sh}"
 FDR_MAX_ITERS="${FDR_MAX_ITERS:-10}"
-FDR_CLEAR_ARTIFACTS="${FDR_CLEAR_ARTIFACTS:-0}"
+FDR_ARCHIVE_ARTIFACTS="${FDR_ARCHIVE_ARTIFACTS:-0}"
 FDR_COMPACT_ARTIFACTS="${FDR_COMPACT_ARTIFACTS:-1}"
 FDR_PR_REVIEW="${FDR_PR_REVIEW:-0}"
 
@@ -50,13 +50,13 @@ usage() {
     echo "Options:"
     echo "  -c, --check-cmd CMD      Command to run checks (default: ./scripts/ci.sh)"
     echo "  -n, --max-iters N        Maximum loop iterations (default: 10)"
-    echo "      --clear-artifacts    Clear existing artifacts before starting"
+    echo "      --archive-artifacts  Archive existing artifacts to a timestamped folder"
     echo "      --no-compact         Skip automatic compaction of large artifacts"
     echo "      --pr-review          Enable PR review mode"
     echo "  -h, --help               Show this help message"
     echo ""
     echo "Environment variables can also be used:"
-    echo "  FDR_CHECK_CMD, FDR_MAX_ITERS, FDR_CLEAR_ARTIFACTS, FDR_COMPACT_ARTIFACTS, FDR_PR_REVIEW"
+    echo "  FDR_CHECK_CMD, FDR_MAX_ITERS, FDR_ARCHIVE_ARTIFACTS, FDR_COMPACT_ARTIFACTS, FDR_PR_REVIEW"
 }
 
 log() {
@@ -335,8 +335,10 @@ If a file was not provided (doesn't exist), skip it."; then
 run_pi() {
     local exit_code=0
     # Run pi, capturing stderr to log file while still showing stdout
-    if ! pi "$@" 2> >(tee -a "$PI_LOG" >&2); then
-        exit_code=$?
+    # Use || to capture exit code because process substitution makes ! tricky
+    pi "$@" 2> >(tee -a "$PI_LOG" >&2) || exit_code=$?
+    
+    if [[ $exit_code -ne 0 ]]; then
         error "pi exited with code $exit_code"
         error "pi stderr logged to: $PI_LOG"
         if [[ -f "$PI_LOG" ]]; then
@@ -451,6 +453,37 @@ collect_bounded_context_files() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# Check for large files (>2000 lines) and generate a warning/recommendation
+# ---------------------------------------------------------------------------
+detect_large_files_warning() {
+    local warning=""
+    local found_large=0
+
+    for f in "$@"; do
+        if [[ -f "$PROJECT_ROOT/$f" ]]; then
+            local lines
+            lines=$(wc -l < "$PROJECT_ROOT/$f" | tr -d ' ')
+            if [[ "$lines" -gt 2000 ]]; then
+                if [[ $found_large -eq 0 ]]; then
+                    warning+="\nCRITICAL WARNING: The following files are >2000 lines and will be TRUNCATED by the 'read' tool:\n"
+                fi
+                warning+="- $f ($lines lines)\n"
+                found_large=1
+            fi
+        fi
+    done
+
+    if [[ $found_large -eq 1 ]]; then
+        warning+="You CANNOT see the bottom of these files. If errors occur there, you are flying blind.\n"
+        warning+="STRONGLY RECOMMENDED: Split these files into smaller files or modules to bring them under the 2000-line limit. You cannot reliably fix errors in files you cannot fully read.\n"
+        warning+="  - If the file contains tests at the bottom, move them to a separate test file (e.g., tests.rs, test_file.py, file.test.js).\n"
+        warning+="  - If it is a large logic file, extract cohesive functionality into separate source files or subfolders.\n"
+    fi
+    
+    echo "$warning"
+}
+
 append_review_entry() {
     local timestamp
     timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -506,8 +539,8 @@ main() {
                     exit 1
                 fi
                 ;;
-            --clear-artifacts)
-                FDR_CLEAR_ARTIFACTS=1
+            --archive-artifacts)
+                FDR_ARCHIVE_ARTIFACTS=1
                 shift
                 ;;
             --no-compact)
@@ -548,9 +581,13 @@ main() {
         fi
     fi
 
-    if [[ "$FDR_CLEAR_ARTIFACTS" == "1" || "$FDR_CLEAR_ARTIFACTS" == "true" ]]; then
-        log "Clearing existing .log and .md artifacts in $FDR_DIR"
-        find "$FDR_DIR" -mindepth 1 -maxdepth 1 -type f \( -name "*.log" -o -name "*.md" \) -exec rm -f -- {} +
+    if [[ "$FDR_ARCHIVE_ARTIFACTS" == "1" || "$FDR_ARCHIVE_ARTIFACTS" == "true" ]]; then
+        local timestamp
+        timestamp=$(date +%Y%m%d_%H%M%S)
+        local archive_dir="$FDR_DIR/archive/$timestamp"
+        log "Archiving existing artifacts to $archive_dir"
+        mkdir -p "$archive_dir"
+        find "$FDR_DIR" -mindepth 1 -maxdepth 1 -type f \( -name "*.log" -o -name "*.md" \) -exec mv -- {} "$archive_dir/" \;
     fi
 
     # Record starting commit SHA for rollback (stored in a file, not a git tag,
@@ -630,6 +667,22 @@ main() {
                 done
             fi
 
+            # Extract error locations (file:line) and check for common Rust errors
+            local error_locations=""
+            local missing_field_hint=""
+            
+            if [[ -f "$CHECKS_FILTERED_LOG" ]]; then
+                error_locations=$(grep -oE "[a-zA-Z0-9_/.-]+:[0-9]+" "$CHECKS_FILTERED_LOG" | head -n 20 | sort -u | tr '\n' ' ')
+                
+                if grep -q "missing field" "$CHECKS_FILTERED_LOG"; then
+                     missing_field_hint="HINT: You seem to have a 'missing field' error. You likely updated a struct definition but forgot to update some initializations. Search the codebase for the struct name to find ALL usages (e.g., in tests) and update them."
+                fi
+            fi
+
+            # Check for large files
+            local large_file_warning
+            large_file_warning=$(detect_large_files_warning "${changed_files[@]}")
+
             # Construct prompt for fix step
             fix_checks_prompt="The file .fix-die-repeat/checks_filtered.log contains the failure output from \`${FDR_CHECK_CMD}\` (filtered to error-relevant lines; full log is in .fix-die-repeat/checks.log). "
             if [[ -n "$repeated_failure_warning" ]]; then
@@ -642,6 +695,20 @@ main() {
                  fix_checks_prompt+="I have attached .fix-die-repeat/build_history.md which contains a summary of files you modified in previous attempts to fix the build. Use this to avoid repeating ineffective changes. "
             fi
             fix_checks_prompt+="I have also attached the currently changed files for context. "
+            
+            if [[ -n "$error_locations" ]]; then
+                fix_checks_prompt+="\n\nDetected error locations: $error_locations\n"
+                fix_checks_prompt+="CRITICAL: If errors are on lines > 2000, you MUST use 'read' with 'offset' to see the code. The 'read' tool truncates large files by default.\n"
+            fi
+            
+            if [[ -n "$missing_field_hint" ]]; then
+                fix_checks_prompt+="\n$missing_field_hint\n"
+            fi
+
+            if [[ -n "$large_file_warning" ]]; then
+                fix_checks_prompt+="$large_file_warning"
+            fi
+            
             fix_checks_prompt+="Your goal is to FIX the errors. Follow this plan:\n"
             fix_checks_prompt+="1. ANALYZE the log and identify the root cause.\n"
             fix_checks_prompt+="2. PLAN your fix.\n"
@@ -692,15 +759,16 @@ main() {
             done < <(collect_bounded_context_files)
 
             if [[ ${#changed_files[@]} -eq 0 ]]; then
-                error "No changed or staged files found. Nothing to review."
-                exit 1
+                log "No changed or staged files found to review. Checks passed. Exiting."
+                exit 0
             fi
 
             log "[Step 4] Found ${#changed_files[@]} file(s) to review"
 
             # Step 5: Run pi review
             log "[Step 5] Running pi to review files..."
-            pi_args=("-p")
+            # Restrict tools to prevent accidental fixes (no edit/bash), but allow grep/find/ls for exploration
+            pi_args=("-p" "--tools" "read,write,grep,find,ls")
             for f in "${changed_files[@]}"; do
                 pi_args+=("@$f")
             done
@@ -710,6 +778,7 @@ main() {
 
             if ! run_pi_safe "${pi_args[@]}" "Review all of the provided files for issues. Use .fix-die-repeat/review.md as historical context.
 Your task is ONLY to identify and document issues. Do NOT fix them yourself.
+Note: You do not have access to 'edit' or 'bash', so you cannot apply fixes even if you wanted to.
 
 Classify issues as:
 - [CRITICAL]: Bugs, security flaws, compilation errors, broken logic.
