@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# fix-die-repeat.sh - Automated check, review, and fix loop using pi
+# fix-die-repeat - Automated check, review, and fix loop using pi
 #
 # Usage: fix-die-repeat [OPTIONS]
 #
@@ -8,11 +8,12 @@
 #   -c, --check-cmd CMD      Command to run checks (default: ./scripts/ci.sh)
 #   -n, --max-iters N        Maximum loop iterations (default: 10)
 #       --clear-artifacts    Clear existing artifacts before starting
+#       --no-compact         Skip automatic compaction of large artifacts
 #       --pr-review          Enable PR review mode
 #   -h, --help               Show this help message
 #
 # Environment variables:
-#   FDR_CHECK_CMD, FDR_MAX_ITERS, FDR_CLEAR_ARTIFACTS, FDR_PR_REVIEW
+#   FDR_CHECK_CMD, FDR_MAX_ITERS, FDR_CLEAR_ARTIFACTS, FDR_COMPACT_ARTIFACTS, FDR_PR_REVIEW
 #
 
 set -euo pipefail
@@ -21,20 +22,27 @@ set -euo pipefail
 FDR_CHECK_CMD="${FDR_CHECK_CMD:-./scripts/ci.sh}"
 FDR_MAX_ITERS="${FDR_MAX_ITERS:-10}"
 FDR_CLEAR_ARTIFACTS="${FDR_CLEAR_ARTIFACTS:-0}"
+FDR_COMPACT_ARTIFACTS="${FDR_COMPACT_ARTIFACTS:-1}"
 FDR_PR_REVIEW="${FDR_PR_REVIEW:-0}"
 
 # Paths
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 FDR_DIR="$PROJECT_ROOT/.fix-die-repeat"
 REVIEW_FILE="$FDR_DIR/review.md"
 REVIEW_CURRENT_FILE="$FDR_DIR/review_current.md"
 BUILD_HISTORY_FILE="$FDR_DIR/build_history.md"
 CHECKS_LOG="$FDR_DIR/checks.log"
+CHECKS_FILTERED_LOG="$FDR_DIR/checks_filtered.log"
+CHECKS_HASH_FILE="$FDR_DIR/.checks_hashes"
 PI_LOG="$FDR_DIR/pi.log"
 
+# Context limits for changed files attached to pi
+MAX_CONTEXT_FILES=10
+MAX_CONTEXT_BYTES=$((200 * 1024))  # 200KB
+
 iteration=0
-PREV_CHECKS_HASH=""
+FDR_START_SHA=""
+FDR_START_SHA_FILE="$FDR_DIR/.start_sha"
 
 usage() {
     echo "Usage: $(basename "$0") [OPTIONS]"
@@ -43,11 +51,12 @@ usage() {
     echo "  -c, --check-cmd CMD      Command to run checks (default: ./scripts/ci.sh)"
     echo "  -n, --max-iters N        Maximum loop iterations (default: 10)"
     echo "      --clear-artifacts    Clear existing artifacts before starting"
+    echo "      --no-compact         Skip automatic compaction of large artifacts"
     echo "      --pr-review          Enable PR review mode"
     echo "  -h, --help               Show this help message"
     echo ""
     echo "Environment variables can also be used:"
-    echo "  FDR_CHECK_CMD, FDR_MAX_ITERS, FDR_CLEAR_ARTIFACTS, FDR_PR_REVIEW"
+    echo "  FDR_CHECK_CMD, FDR_MAX_ITERS, FDR_CLEAR_ARTIFACTS, FDR_COMPACT_ARTIFACTS, FDR_PR_REVIEW"
 }
 
 log() {
@@ -76,8 +85,20 @@ format_duration() {
 # Cleanup and logging on unexpected exit
 cleanup() {
     local exit_code=$?
+    local end_time
+    end_time=$(date +%s)
+
+    if [[ -n "${script_start_time:-}" ]]; then
+        local duration=$((end_time - script_start_time))
+        log "Total run duration: $(format_duration "$duration")"
+    fi
+
     if [[ $exit_code -ne 0 ]]; then
         error "Script exited unexpectedly with code $exit_code at iteration $iteration"
+        if [[ -n "$FDR_START_SHA" ]]; then
+            error "To see all changes made: git diff $FDR_START_SHA"
+            error "To revert all changes:   git checkout $FDR_START_SHA -- ."
+        fi
         if [[ -f "$PI_LOG" ]] && [[ -s "$PI_LOG" ]]; then
             error "=== Last 30 lines of pi.log ==="
             tail -30 "$PI_LOG" >&2
@@ -87,7 +108,73 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# ---------------------------------------------------------------------------
+# Filter checks.log to extract the most useful failure information.
+# Keeps error/warning lines with surrounding context, plus the log tail
+# (which typically contains the summary). Writes to CHECKS_FILTERED_LOG.
+# ---------------------------------------------------------------------------
+filter_checks_log() {
+    local max_lines=300
+    local context_lines=3
+    local tail_lines=80
+
+    if [[ ! -f "$CHECKS_LOG" ]]; then
+        return 0
+    fi
+
+    local total_lines
+    total_lines=$(wc -l < "$CHECKS_LOG")
+
+    # If the log is small enough, just use it directly
+    if [[ $total_lines -le $max_lines ]]; then
+        cp "$CHECKS_LOG" "$CHECKS_FILTERED_LOG"
+        return 0
+    fi
+
+    log "Filtering checks.log ($total_lines lines -> ~${max_lines} target)..."
+
+    {
+        echo "=== FILTERED CHECK OUTPUT (full log: .fix-die-repeat/checks.log, $total_lines lines) ==="
+        echo ""
+        echo "--- Error/failure lines with context ---"
+        grep -i -n -B "$context_lines" -A "$context_lines" \
+            -E '(error[:\[ ]|ERROR[:\[ ]|fatal|FATAL|FAILED|panic|exception|undefined reference|cannot find|no such file|not found|segfault|abort|compilation failed|build failed|assert)' \
+            "$CHECKS_LOG" | head -200 || true
+        echo ""
+        echo "--- Last ${tail_lines} lines ---"
+        tail -n "$tail_lines" "$CHECKS_LOG"
+    } > "$CHECKS_FILTERED_LOG"
+
+    local filtered_lines
+    filtered_lines=$(wc -l < "$CHECKS_FILTERED_LOG")
+    log "Filtered checks.log: $total_lines -> $filtered_lines lines"
+}
+
+# ---------------------------------------------------------------------------
+# Check for oscillation by tracking check output hashes across iterations.
+# Prints a warning message if oscillation is detected (empty otherwise).
+# ---------------------------------------------------------------------------
+check_oscillation() {
+    local current_hash="$1"
+
+    if [[ -f "$CHECKS_HASH_FILE" ]]; then
+        local prev_match
+        prev_match=$(grep "^${current_hash}:" "$CHECKS_HASH_FILE" | tail -1 || true)
+        if [[ -n "$prev_match" ]]; then
+            local prev_iter
+            prev_iter="${prev_match#*:}"
+            log "Detected oscillation: iteration $iteration matches iteration $prev_iter"
+            echo "WARNING: Check output is IDENTICAL to iteration ${prev_iter}. You are going in CIRCLES. Your previous approach did NOT work — you MUST try a fundamentally DIFFERENT strategy."
+        fi
+    fi
+
+    # Record this hash
+    echo "${current_hash}:${iteration}" >> "$CHECKS_HASH_FILE"
+}
+
+# ---------------------------------------------------------------------------
 # Fetch PR threads and format them for the agent
+# ---------------------------------------------------------------------------
 fetch_pr_threads() {
     local branch
     branch=$(git branch --show-current)
@@ -151,7 +238,6 @@ fetch_pr_threads() {
     fi
 
     # Parse and format threads using jq
-    # We filter for !isResolved and format the output
     local threads_output
     threads_output=$(echo "$gql_result" | jq -r '
         .data.repository.pullRequest.reviewThreads.nodes
@@ -193,7 +279,59 @@ fetch_pr_threads() {
     fi
 }
 
-# Run pi with logging - captures exit code and logs failures
+# ---------------------------------------------------------------------------
+# Compact large persistent artifacts to preserve lessons while reducing noise
+# ---------------------------------------------------------------------------
+maybe_compact_artifacts() {
+    if [[ "$FDR_COMPACT_ARTIFACTS" != "1" && "$FDR_COMPACT_ARTIFACTS" != "true" ]]; then
+        return 0
+    fi
+
+    local threshold_lines=200
+    local needs_compact=0
+
+    for f in "$REVIEW_FILE" "$BUILD_HISTORY_FILE"; do
+        if [[ -f "$f" ]] && [[ $(wc -l < "$f") -gt $threshold_lines ]]; then
+            needs_compact=1
+            break
+        fi
+    done
+
+    if [[ "$needs_compact" -eq 0 ]]; then
+        return 0
+    fi
+
+    log "Artifacts exceed ${threshold_lines} lines. Compacting with pi..."
+
+    local compact_args=("-p")
+    [[ -f "$REVIEW_FILE" ]] && compact_args+=("@$REVIEW_FILE")
+    [[ -f "$BUILD_HISTORY_FILE" ]] && compact_args+=("@$BUILD_HISTORY_FILE")
+
+    # Backup originals
+    [[ -f "$REVIEW_FILE" ]] && cp "$REVIEW_FILE" "$REVIEW_FILE.bak"
+    [[ -f "$BUILD_HISTORY_FILE" ]] && cp "$BUILD_HISTORY_FILE" "$BUILD_HISTORY_FILE.bak"
+
+    if ! run_pi_safe "${compact_args[@]}" \
+        "These are history files from previous fix-die-repeat runs. They have grown large and need compacting.
+
+Your task: read both files and write compacted versions that preserve:
+1. Key lessons learned and approaches that FAILED (and why) — these prevent repeated mistakes.
+2. Any unresolved or recurring known issues.
+3. File paths and areas that have been repeatedly problematic.
+
+Write the compacted review history to '$REVIEW_FILE' and the compacted build history to '$BUILD_HISTORY_FILE'.
+Target ~50 lines each. Be concise but do NOT discard failure patterns — those are the most valuable information.
+If a file was not provided (doesn't exist), skip it."; then
+        log "Compaction failed. Continuing with existing artifacts."
+        return 0
+    fi
+
+    log "Compaction complete. Backups saved as .bak files in $FDR_DIR."
+}
+
+# ---------------------------------------------------------------------------
+# Run pi with logging — captures exit code and logs failures
+# ---------------------------------------------------------------------------
 run_pi() {
     local exit_code=0
     # Run pi, capturing stderr to log file while still showing stdout
@@ -210,17 +348,107 @@ run_pi() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# Run pi with a single retry on failure. Returns 0 on success, 1 on double
+# failure. Prevents a transient pi crash from killing the entire run.
+# ---------------------------------------------------------------------------
+run_pi_safe() {
+    local exit_code=0
+    run_pi "$@" || exit_code=$?
+
+    if [[ $exit_code -eq 0 ]]; then
+        return 0
+    fi
+
+    log "pi failed (exit $exit_code). Retrying once..."
+
+    exit_code=0
+    run_pi "$@" || exit_code=$?
+
+    if [[ $exit_code -eq 0 ]]; then
+        return 0
+    fi
+
+    error "pi failed twice (exit $exit_code). Continuing loop without pi output for this step."
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Get changed (staged + unstaged) files, deduplicated, excluding deleted
+# files and .fix-die-repeat/ contents.
+# ---------------------------------------------------------------------------
 get_changed_files() {
-    # Get both staged and unstaged changed files, deduplicate, filter to existing files only
     {
         git diff --name-only 2>/dev/null || true
         git diff --cached --name-only 2>/dev/null || true
+        git ls-files --others --exclude-standard 2>/dev/null || true
     } | sort -u | while IFS= read -r file; do
-        # Only include files that exist (exclude deleted files and .fix-die-repeat directory)
         if [[ -f "$PROJECT_ROOT/$file" ]] && [[ "$file" != .fix-die-repeat/* ]]; then
             echo "$file"
         fi
     done
+}
+
+# ---------------------------------------------------------------------------
+# Collect changed files with size and count limits to avoid context window
+# blowout. Prioritizes files mentioned in an optional error log.
+# Prints selected filenames to stdout, one per line.
+# Usage: read into an array via: mapfile -t arr < <(collect_bounded_context_files ...)
+#   or for bash 3.x: while IFS= read -r f; do arr+=("$f"); done < <(...)
+# ---------------------------------------------------------------------------
+collect_bounded_context_files() {
+    local error_log="${1:-}"
+
+    local all_files=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && all_files+=("$line")
+    done < <(get_changed_files)
+
+    if [[ ${#all_files[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    # If we have an error log, prioritize files mentioned in it
+    local prioritized=()
+    local rest=()
+    if [[ -n "$error_log" ]] && [[ -f "$error_log" ]]; then
+        for f in "${all_files[@]}"; do
+            if grep -qF "$(basename "$f")" "$error_log" 2>/dev/null; then
+                prioritized+=("$f")
+            else
+                rest+=("$f")
+            fi
+        done
+    else
+        rest=("${all_files[@]}")
+    fi
+
+    # Merge: prioritized first, then rest
+    local ordered=()
+    [[ ${#prioritized[@]} -gt 0 ]] && ordered+=("${prioritized[@]}")
+    [[ ${#rest[@]} -gt 0 ]] && ordered+=("${rest[@]}")
+
+    local total_bytes=0
+    local count=0
+    for f in "${ordered[@]}"; do
+        if [[ $count -ge $MAX_CONTEXT_FILES ]]; then
+            log "Context file limit reached ($MAX_CONTEXT_FILES files). Skipping remaining $((${#ordered[@]} - count)) files." >&2
+            break
+        fi
+        local fsize
+        fsize=$(wc -c < "$PROJECT_ROOT/$f" 2>/dev/null || echo 0)
+        if [[ $((total_bytes + fsize)) -gt $MAX_CONTEXT_BYTES ]] && [[ $count -gt 0 ]]; then
+            log "Context size limit reached (~$((total_bytes / 1024))KB). Skipping remaining files." >&2
+            break
+        fi
+        echo "$f"
+        total_bytes=$((total_bytes + fsize))
+        count=$((count + 1))
+    done
+
+    if [[ $count -lt ${#all_files[@]} ]]; then
+        log "Attached ${count} of ${#all_files[@]} changed files (~$((total_bytes / 1024))KB)" >&2
+    fi
 }
 
 append_review_entry() {
@@ -249,6 +477,8 @@ append_resolution_entry() {
 }
 
 main() {
+    script_start_time=$(date +%s)
+
     # Argument parsing
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -264,6 +494,10 @@ main() {
                 ;;
             -n|--max-iters)
                 if [[ -n "${2:-}" && ! "$2" =~ ^- ]]; then
+                    if [[ ! "$2" =~ ^[0-9]+$ ]] || [[ "$2" -le 0 ]]; then
+                        error "Invalid value for --max-iters: $2. Must be a positive integer."
+                        exit 1
+                    fi
                     FDR_MAX_ITERS="$2"
                     shift 2
                 else
@@ -274,6 +508,10 @@ main() {
                 ;;
             --clear-artifacts)
                 FDR_CLEAR_ARTIFACTS=1
+                shift
+                ;;
+            --no-compact)
+                FDR_COMPACT_ARTIFACTS=0
                 shift
                 ;;
             --pr-review)
@@ -292,19 +530,44 @@ main() {
         esac
     done
 
+    # Validate final configuration
+    if [[ ! "$FDR_MAX_ITERS" =~ ^[0-9]+$ ]] || [[ "$FDR_MAX_ITERS" -le 0 ]]; then
+        error "Invalid configuration: FDR_MAX_ITERS must be a positive integer (got '$FDR_MAX_ITERS')"
+        exit 1
+    fi
+
     cd "$PROJECT_ROOT"
 
-    # Ensure .fix-die-repeat directory exists
+    # Ensure .fix-die-repeat directory exists and is gitignored
     mkdir -p "$FDR_DIR"
+    if [[ -d "$PROJECT_ROOT/.git" ]]; then
+        local gitignore="$PROJECT_ROOT/.gitignore"
+        if ! grep -qxF '.fix-die-repeat/' "$gitignore" 2>/dev/null; then
+            echo '.fix-die-repeat/' >> "$gitignore"
+            log "Added .fix-die-repeat/ to .gitignore"
+        fi
+    fi
 
     if [[ "$FDR_CLEAR_ARTIFACTS" == "1" || "$FDR_CLEAR_ARTIFACTS" == "true" ]]; then
         log "Clearing existing .log and .md artifacts in $FDR_DIR"
         find "$FDR_DIR" -mindepth 1 -maxdepth 1 -type f \( -name "*.log" -o -name "*.md" \) -exec rm -f -- {} +
     fi
 
-    # Clear pi.log at start of run
+    # Record starting commit SHA for rollback (stored in a file, not a git tag,
+    # to avoid any risk of tags being pushed to remotes)
+    if git rev-parse HEAD >/dev/null 2>&1; then
+        FDR_START_SHA=$(git rev-parse HEAD)
+        echo "$FDR_START_SHA" > "$FDR_START_SHA_FILE"
+        log "Git checkpoint: $FDR_START_SHA"
+    fi
+
+    # Clear per-run files
     > "$PI_LOG"
+    > "$CHECKS_HASH_FILE"
     log "Logging pi stderr to: $PI_LOG"
+
+    # Compact large artifacts from previous runs
+    maybe_compact_artifacts
 
     while true; do
         iteration=$((iteration + 1))
@@ -312,13 +575,17 @@ main() {
 
         if [[ $iteration -gt $FDR_MAX_ITERS ]]; then
             error "Maximum iterations ($FDR_MAX_ITERS) exceeded. Could not resolve all issues."
+            if [[ -n "$FDR_START_SHA" ]]; then
+                error "To see all changes made: git diff $FDR_START_SHA"
+                error "To revert all changes:   git checkout $FDR_START_SHA -- ."
+            fi
             exit 1
         fi
 
         # Step 1: Run checks
         log "[Step 1] Running ${FDR_CHECK_CMD} (output: checks.log)..."
         checks_start_time=$(date +%s)
-        if ${FDR_CHECK_CMD} > "$CHECKS_LOG" 2>&1; then
+        if bash -c "$FDR_CHECK_CMD" > "$CHECKS_LOG" 2>&1; then
             checks_status=0
         else
             checks_status=$?
@@ -327,43 +594,44 @@ main() {
         checks_duration=$((checks_end_time - checks_start_time))
         log "[Step 1] run_checks duration: $(format_duration "$checks_duration")"
 
-        # Check for repeated failures to prevent loops
+        # Check for oscillation (repeated identical failure output)
         current_checks_hash=$(git hash-object "$CHECKS_LOG" 2>/dev/null || echo "iteration_$iteration")
         repeated_failure_warning=""
 
         if [[ "$checks_status" -ne 0 ]]; then
-             if [[ "$current_checks_hash" == "$PREV_CHECKS_HASH" ]]; then
-                 repeated_failure_warning="WARNING: The check output is IDENTICAL to the previous iteration. Your last fix did NOT work. You must try a DIFFERENT approach."
-                 log "Detected identical check output. Adding warning to prompt."
-             fi
+            repeated_failure_warning=$(check_oscillation "$current_checks_hash")
         fi
-        PREV_CHECKS_HASH="$current_checks_hash"
 
         if [[ $checks_status -eq 0 ]]; then
             log "[Step 2B] Checks passed. Proceeding to review."
         else
             log "[Step 2A] Checks failed. Running pi to fix errors..."
 
-            # Collect files to context
-            changed_files=()
-            while IFS= read -r line; do
-                [[ -n "$line" ]] && changed_files+=("$line")
-            done < <(get_changed_files)
+            # Filter the checks log for relevant content
+            filter_checks_log
 
-            # Construct args for fix step
-            fix_checks_args=("-p" "@$CHECKS_LOG")
+            # Collect context files with limits, prioritizing files in error output
+            changed_files=()
+            while IFS= read -r f; do
+                [[ -n "$f" ]] && changed_files+=("$f")
+            done < <(collect_bounded_context_files "$CHECKS_FILTERED_LOG")
+
+            # Construct args for fix step — use filtered log
+            fix_checks_args=("-p" "@$CHECKS_FILTERED_LOG")
             if [[ -f "$REVIEW_FILE" ]]; then
                 fix_checks_args+=("@$REVIEW_FILE")
             fi
             if [[ -f "$BUILD_HISTORY_FILE" ]]; then
                 fix_checks_args+=("@$BUILD_HISTORY_FILE")
             fi
-            for f in "${changed_files[@]}"; do
-                fix_checks_args+=("@$f")
-            done
+            if [[ ${#changed_files[@]} -gt 0 ]]; then
+                for f in "${changed_files[@]}"; do
+                    fix_checks_args+=("@$f")
+                done
+            fi
 
             # Construct prompt for fix step
-            fix_checks_prompt="The file .fix-die-repeat/checks.log contains the failure output from ${FDR_CHECK_CMD}. "
+            fix_checks_prompt="The file .fix-die-repeat/checks_filtered.log contains the failure output from \`${FDR_CHECK_CMD}\` (filtered to error-relevant lines; full log is in .fix-die-repeat/checks.log). "
             if [[ -n "$repeated_failure_warning" ]]; then
                 fix_checks_prompt+="$repeated_failure_warning "
             fi
@@ -374,9 +642,15 @@ main() {
                  fix_checks_prompt+="I have attached .fix-die-repeat/build_history.md which contains a summary of files you modified in previous attempts to fix the build. Use this to avoid repeating ineffective changes. "
             fi
             fix_checks_prompt+="I have also attached the currently changed files for context. "
-            fix_checks_prompt+="Your goal is to FIX the errors. Follow this plan:\n1. ANALYZE the log and identify the root cause.\n2. PLAN your fix.\n3. APPLY the fix using 'edit'.\n4. VERIFY the fix by running the relevant command locally (using 'bash').\nDo not exit until you have verified the fix works."
+            fix_checks_prompt+="Your goal is to FIX the errors. Follow this plan:\n"
+            fix_checks_prompt+="1. ANALYZE the log and identify the root cause.\n"
+            fix_checks_prompt+="2. PLAN your fix.\n"
+            fix_checks_prompt+="3. APPLY the fix using 'edit'.\n"
+            fix_checks_prompt+="4. VERIFY with a quick targeted check (e.g., compile the affected file, run the specific failing test). Do NOT run the full \`${FDR_CHECK_CMD}\` — the outer loop will do that."
 
-            run_pi "${fix_checks_args[@]}" "$fix_checks_prompt"
+            if ! run_pi_safe "${fix_checks_args[@]}" "$fix_checks_prompt"; then
+                log "pi could not produce a fix this iteration. Continuing to next iteration."
+            fi
 
             # Record history
             {
@@ -413,9 +687,9 @@ main() {
             # Step 4: Collect files
             log "[Step 4] Collecting changed and staged files..."
             changed_files=()
-            while IFS= read -r line; do
-                [[ -n "$line" ]] && changed_files+=("$line")
-            done < <(get_changed_files)
+            while IFS= read -r f; do
+                [[ -n "$f" ]] && changed_files+=("$f")
+            done < <(collect_bounded_context_files)
 
             if [[ ${#changed_files[@]} -eq 0 ]]; then
                 error "No changed or staged files found. Nothing to review."
@@ -434,7 +708,7 @@ main() {
                 pi_args+=("@$REVIEW_FILE")
             fi
 
-            run_pi "${pi_args[@]}" "Review all of the provided files for issues. Use .fix-die-repeat/review.md as historical context.
+            if ! run_pi_safe "${pi_args[@]}" "Review all of the provided files for issues. Use .fix-die-repeat/review.md as historical context.
 Your task is ONLY to identify and document issues. Do NOT fix them yourself.
 
 Classify issues as:
@@ -447,7 +721,10 @@ IMPORTANT:
 3. If you find [CRITICAL] issues, report BOTH [CRITICAL] and [NIT] issues.
 
 If you find reportable issues, use the 'write' tool to save them to '.fix-die-repeat/review_current.md' in the project root.
-If you find NO reportable issues, use the 'write' tool to create an empty file named '.fix-die-repeat/review_current.md' in the project root."
+If you find NO reportable issues, use the 'write' tool to create an empty file named '.fix-die-repeat/review_current.md' in the project root."; then
+                log "pi review failed. Treating as no issues found."
+                touch "$REVIEW_CURRENT_FILE"
+            fi
         fi
 
         append_review_entry
@@ -466,21 +743,31 @@ If you find NO reportable issues, use the 'write' tool to create an empty file n
                 fix_args+=("@$REVIEW_FILE")
             fi
 
-            run_pi "${fix_args[@]}" "Fix all issues documented in .fix-die-repeat/review_current.md. Address each issue mentioned in the file.
+            if ! run_pi_safe "${fix_args[@]}" "Fix all issues documented in .fix-die-repeat/review_current.md. Address each issue mentioned in the file.
 
 Follow this plan:
 1. READ the issues in .fix-die-repeat/review_current.md.
 2. PLAN your fixes.
 3. If an issue is a logic bug, CREATE a unit test to prevent regression.
 4. APPLY the fixes using 'edit'.
-5. VERIFY the fixes. Run ${FDR_CHECK_CMD} (or relevant tests) to ensure your changes didn't break the build and new tests pass.
+5. VERIFY with a quick targeted check (e.g., compile the affected file, run the specific failing test). Do NOT run the full \`${FDR_CHECK_CMD}\` — the outer loop will do that.
 
 Ensure that your changes do not re-surface older issues listed in .fix-die-repeat/review.md.
-If these issues are PR threads (indicated by 'Thread #ID'), use the 'resolve_pr_threads' tool to mark them resolved on GitHub ONLY after verifying the fix."
+If these issues are PR threads (indicated by 'Thread #ID'), use the 'resolve_pr_threads' tool to mark them resolved on GitHub ONLY after verifying the fix."; then
+                log "pi fix failed. Continuing to next iteration to re-check."
+            fi
             append_resolution_entry "Fixes applied for .fix-die-repeat/review_current.md; verification pending."
+
+            # Record history for review-fix changes
+            {
+                echo "## Iteration $iteration Review Fixes"
+                git diff --stat
+                echo ""
+            } >> "$BUILD_HISTORY_FILE"
+
             continue
         else
-        log "[Step 6B] No issues found in .fix-die-repeat/review_current.md."
+            log "[Step 6B] No issues found in .fix-die-repeat/review_current.md."
             append_resolution_entry "No issues found."
         fi
 
@@ -488,6 +775,8 @@ If these issues are PR threads (indicated by 'Thread #ID'), use the 'resolve_pr_
         if [[ -f "$REVIEW_CURRENT_FILE" ]]; then
             rm "$REVIEW_CURRENT_FILE"
         fi
+        # Clean up checkpoint file on success
+        rm -f "$FDR_START_SHA_FILE"
         log "[Step 7] Done! All checks passed and no review issues found. .fix-die-repeat/review.md retained."
         exit 0
     done
