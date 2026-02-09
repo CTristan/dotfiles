@@ -475,7 +475,7 @@ detect_large_files_warning() {
     done
 
     if [[ $found_large -eq 1 ]]; then
-        warning+="You CANNOT see the bottom of these files. If errors occur there, you are flying blind.\n"
+        warning+="\n[CRITICAL]: You CANNOT see the bottom of these files. If errors occur there, you are flying blind.\n"
         warning+="STRONGLY RECOMMENDED: Split these files into smaller files or modules to bring them under the 2000-line limit. You cannot reliably fix errors in files you cannot fully read.\n"
         warning+="  - If the file contains tests at the bottom, move them to a separate test file (e.g., tests.rs, test_file.py, file.test.js).\n"
         warning+="  - If it is a large logic file, extract cohesive functionality into separate source files or subfolders.\n"
@@ -719,12 +719,18 @@ main() {
                 log "pi could not produce a fix this iteration. Continuing to next iteration."
             fi
 
-            # Record history
-            {
-                echo "## Iteration $iteration Fixes"
-                git diff --stat
-                echo ""
-            } >> "$BUILD_HISTORY_FILE"
+            # Check if any changes were actually made
+            if [[ -z "$(git diff --name-only)" && -z "$(git ls-files --others --exclude-standard)" && -z "$(git diff --cached --name-only)" ]]; then
+                error "Pi reported success but NO files were modified. This suggests 'edit' commands failed (e.g., text not found)."
+                echo "## Iteration $iteration: FAILED to apply fixes (no files changed)" >> "$BUILD_HISTORY_FILE"
+            else
+                # Record history
+                {
+                    echo "## Iteration $iteration Fixes"
+                    git diff --stat
+                    echo ""
+                } >> "$BUILD_HISTORY_FILE"
+            fi
 
             continue
         fi
@@ -827,12 +833,18 @@ If these issues are PR threads (indicated by 'Thread #ID'), use the 'resolve_pr_
             fi
             append_resolution_entry "Fixes applied for .fix-die-repeat/review_current.md; verification pending."
 
-            # Record history for review-fix changes
-            {
-                echo "## Iteration $iteration Review Fixes"
-                git diff --stat
-                echo ""
-            } >> "$BUILD_HISTORY_FILE"
+            # Check if any changes were actually made
+            if [[ -z "$(git diff --name-only)" && -z "$(git ls-files --others --exclude-standard)" && -z "$(git diff --cached --name-only)" ]]; then
+                error "Pi reported success but NO files were modified. This suggests 'edit' commands failed (e.g., text not found)."
+                echo "## Iteration $iteration: Review Fixes FAILED (no files changed)" >> "$BUILD_HISTORY_FILE"
+            else
+                # Record history for review-fix changes
+                {
+                    echo "## Iteration $iteration Review Fixes"
+                    git diff --stat
+                    echo ""
+                } >> "$BUILD_HISTORY_FILE"
+            fi
 
             continue
         else
