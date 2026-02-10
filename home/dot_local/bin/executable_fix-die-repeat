@@ -24,6 +24,7 @@ FDR_MAX_ITERS="${FDR_MAX_ITERS:-10}"
 FDR_ARCHIVE_ARTIFACTS="${FDR_ARCHIVE_ARTIFACTS:-0}"
 FDR_COMPACT_ARTIFACTS="${FDR_COMPACT_ARTIFACTS:-1}"
 FDR_PR_REVIEW="${FDR_PR_REVIEW:-0}"
+FDR_DEBUG="${FDR_DEBUG:-0}"
 
 # Paths
 PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -35,10 +36,13 @@ CHECKS_LOG="$FDR_DIR/checks.log"
 CHECKS_FILTERED_LOG="$FDR_DIR/checks_filtered.log"
 CHECKS_HASH_FILE="$FDR_DIR/.checks_hashes"
 PI_LOG="$FDR_DIR/pi.log"
+FDR_LOG="$FDR_DIR/fdr.log"
+SESSION_LOG=""
 
-# Context limits for changed files attached to pi
-MAX_CONTEXT_FILES=10
-MAX_CONTEXT_BYTES=$((200 * 1024))  # 200KB
+# Context limit: If changed files exceed this size (approx 100k tokens),
+# we list them in the prompt instead of auto-attaching their content.
+# This forces the agent to 'pull' only what it needs.
+AUTO_ATTACH_THRESHOLD=$((200 * 1024))  # 200KB
 
 iteration=0
 FDR_START_SHA=""
@@ -53,18 +57,33 @@ usage() {
     echo "      --archive-artifacts  Archive existing artifacts to a timestamped folder"
     echo "      --no-compact         Skip automatic compaction of large artifacts"
     echo "      --pr-review          Enable PR review mode"
+    echo "  -d, --debug              Enable debug mode (timestamped session logs)"
     echo "  -h, --help               Show this help message"
     echo ""
     echo "Environment variables can also be used:"
-    echo "  FDR_CHECK_CMD, FDR_MAX_ITERS, FDR_ARCHIVE_ARTIFACTS, FDR_COMPACT_ARTIFACTS, FDR_PR_REVIEW"
+    echo "  FDR_CHECK_CMD, FDR_MAX_ITERS, FDR_ARCHIVE_ARTIFACTS, FDR_COMPACT_ARTIFACTS, FDR_PR_REVIEW, FDR_DEBUG"
 }
 
 log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [fdr] $*"
+    local message="[$(date '+%Y-%m-%d %H:%M:%S')] [fdr] $*"
+    echo "$message"
+    if [[ -n "${FDR_LOG:-}" ]]; then
+        echo "$message" >> "$FDR_LOG"
+    fi
+    if [[ -n "${SESSION_LOG:-}" ]]; then
+        echo "$message" >> "$SESSION_LOG"
+    fi
 }
 
 error() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [fdr] ERROR: $*" >&2
+    local message="[$(date '+%Y-%m-%d %H:%M:%S')] [fdr] ERROR: $*"
+    echo "$message" >&2
+    if [[ -n "${FDR_LOG:-}" ]]; then
+        echo "$message" >> "$FDR_LOG"
+    fi
+    if [[ -n "${SESSION_LOG:-}" ]]; then
+        echo "$message" >> "$SESSION_LOG"
+    fi
 }
 
 format_duration() {
@@ -80,6 +99,23 @@ format_duration() {
     else
         printf "%ds" "$seconds"
     fi
+}
+
+append_to_session_log() {
+    local title="$1"
+    local source_file="$2"
+
+    if [[ -z "${SESSION_LOG:-}" || ! -f "$source_file" ]]; then
+        return 0
+    fi
+
+    {
+        echo ""
+        echo "===== $title ====="
+        cat "$source_file"
+        echo "===== End $title ====="
+        echo ""
+    } >> "$SESSION_LOG"
 }
 
 # Cleanup and logging on unexpected exit
@@ -103,6 +139,9 @@ cleanup() {
             error "=== Last 30 lines of pi.log ==="
             tail -30 "$PI_LOG" >&2
             error "=== End of pi.log excerpt ==="
+        fi
+        if [[ -n "${SESSION_LOG:-}" ]]; then
+            error "Full iteration output for this run: $SESSION_LOG"
         fi
     fi
 }
@@ -330,17 +369,19 @@ If a file was not provided (doesn't exist), skip it."; then
 }
 
 # ---------------------------------------------------------------------------
-# Run pi with logging — captures exit code and logs failures
+# Run pi with logging — captures exit code and logs full output
 # ---------------------------------------------------------------------------
 run_pi() {
     local exit_code=0
-    # Run pi, capturing stderr to log file while still showing stdout
-    # Use || to capture exit code because process substitution makes ! tricky
-    pi "$@" 2> >(tee -a "$PI_LOG" >&2) || exit_code=$?
-    
+    # Capture BOTH stdout and stderr for per-session replay, while preserving
+    # normal terminal output streams.
+    pi "$@" \
+        > >(tee -a "$PI_LOG" "$SESSION_LOG") \
+        2> >(tee -a "$PI_LOG" "$SESSION_LOG" >&2) || exit_code=$?
+
     if [[ $exit_code -ne 0 ]]; then
         error "pi exited with code $exit_code"
-        error "pi stderr logged to: $PI_LOG"
+        error "pi output logged to: $PI_LOG"
         if [[ -f "$PI_LOG" ]]; then
             error "Last 20 lines of pi.log:"
             tail -20 "$PI_LOG" >&2
@@ -362,6 +403,14 @@ run_pi_safe() {
         return 0
     fi
 
+    # Detect capacity error (503) and trigger model skip if found
+    if [[ -f "$PI_LOG" ]] && grep -Ei "503|No capacity" "$PI_LOG" >/dev/null 2>&1; then
+        log "Detected model capacity error (503). Skipping current model..."
+        # Trigger model skip - this will add the failing model to the persistent cooldown file
+        # We use -p to run in print mode
+        pi -p "/model-skip" >/dev/null 2>&1 || true
+    fi
+
     log "pi failed (exit $exit_code). Retrying once..."
 
     exit_code=0
@@ -377,15 +426,39 @@ run_pi_safe() {
 
 # ---------------------------------------------------------------------------
 # Get changed (staged + unstaged) files, deduplicated, excluding deleted
-# files and .fix-die-repeat/ contents.
+# files, .fix-die-repeat/ contents, and large generated files.
 # ---------------------------------------------------------------------------
+
+# Patterns for files that should never be included as context
+# (lock files, minified assets, etc. - large and not useful for fixing code)
+CONTEXT_EXCLUDE_PATTERNS=(
+    "*.lock"            # yarn.lock, Cargo.lock, poetry.lock, Gemfile.lock, composer.lock, Pipfile.lock
+    "*-lock.json"       # package-lock.json
+    "*-lock.yaml"       # pnpm-lock.yaml
+    "go.sum"            # Go module checksums
+    "*.min.*"           # Minified assets (*.min.js, *.min.css)
+)
+
+is_excluded_file() {
+    local file="$1"
+    local basename
+    basename=$(basename "$file")
+    for pattern in "${CONTEXT_EXCLUDE_PATTERNS[@]}"; do
+        # Use bash pattern matching (extglob not needed for these simple patterns)
+        case "$basename" in
+            $pattern) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 get_changed_files() {
     {
         git diff --name-only 2>/dev/null || true
         git diff --cached --name-only 2>/dev/null || true
         git ls-files --others --exclude-standard 2>/dev/null || true
     } | sort -u | while IFS= read -r file; do
-        if [[ -f "$PROJECT_ROOT/$file" ]] && [[ "$file" != .fix-die-repeat/* ]]; then
+        if [[ -f "$PROJECT_ROOT/$file" ]] && [[ "$file" != .fix-die-repeat/* ]] && ! is_excluded_file "$file"; then
             echo "$file"
         fi
     done
@@ -425,31 +498,12 @@ collect_bounded_context_files() {
         rest=("${all_files[@]}")
     fi
 
-    # Merge: prioritized first, then rest
-    local ordered=()
-    [[ ${#prioritized[@]} -gt 0 ]] && ordered+=("${prioritized[@]}")
-    [[ ${#rest[@]} -gt 0 ]] && ordered+=("${rest[@]}")
-
-    local total_bytes=0
-    local count=0
-    for f in "${ordered[@]}"; do
-        if [[ $count -ge $MAX_CONTEXT_FILES ]]; then
-            log "Context file limit reached ($MAX_CONTEXT_FILES files). Skipping remaining $((${#ordered[@]} - count)) files." >&2
-            break
-        fi
-        local fsize
-        fsize=$(wc -c < "$PROJECT_ROOT/$f" 2>/dev/null || echo 0)
-        if [[ $((total_bytes + fsize)) -gt $MAX_CONTEXT_BYTES ]] && [[ $count -gt 0 ]]; then
-            log "Context size limit reached (~$((total_bytes / 1024))KB). Skipping remaining files." >&2
-            break
-        fi
-        echo "$f"
-        total_bytes=$((total_bytes + fsize))
-        count=$((count + 1))
-    done
-
-    if [[ $count -lt ${#all_files[@]} ]]; then
-        log "Attached ${count} of ${#all_files[@]} changed files (~$((total_bytes / 1024))KB)" >&2
+    # Output prioritized first, then rest
+    if [[ ${#prioritized[@]} -gt 0 ]]; then
+        for f in "${prioritized[@]}"; do echo "$f"; done
+    fi
+    if [[ ${#rest[@]} -gt 0 ]]; then
+        for f in "${rest[@]}"; do echo "$f"; done
     fi
 }
 
@@ -551,6 +605,10 @@ main() {
                 FDR_PR_REVIEW=1
                 shift
                 ;;
+            -d|--debug)
+                FDR_DEBUG=1
+                shift
+                ;;
             -h|--help)
                 usage
                 exit 0
@@ -590,6 +648,19 @@ main() {
         find "$FDR_DIR" -mindepth 1 -maxdepth 1 -type f \( -name "*.log" -o -name "*.md" \) -exec mv -- {} "$archive_dir/" \;
     fi
 
+    # Start a per-run session log that captures all iteration output
+    # By default, we use a single session.log to avoid filling the disk.
+    # If debug mode is on, we use a timestamped file.
+    if [[ "$FDR_DEBUG" == "1" || "$FDR_DEBUG" == "true" ]]; then
+        local session_timestamp
+        session_timestamp=$(date +%Y%m%d_%H%M%S)
+        SESSION_LOG="$FDR_DIR/session_${session_timestamp}.log"
+    else
+        SESSION_LOG="$FDR_DIR/session.log"
+    fi
+    > "$SESSION_LOG"
+    log "Logging full session output to: $SESSION_LOG"
+
     # Record starting commit SHA for rollback (stored in a file, not a git tag,
     # to avoid any risk of tags being pushed to remotes)
     if git rev-parse HEAD >/dev/null 2>&1; then
@@ -600,8 +671,10 @@ main() {
 
     # Clear per-run files
     > "$PI_LOG"
+    > "$FDR_LOG"
     > "$CHECKS_HASH_FILE"
-    log "Logging pi stderr to: $PI_LOG"
+    log "Logging pi output to: $PI_LOG"
+    log "Logging fdr output to: $FDR_LOG"
 
     # Compact large artifacts from previous runs
     maybe_compact_artifacts
@@ -630,6 +703,7 @@ main() {
         checks_end_time=$(date +%s)
         checks_duration=$((checks_end_time - checks_start_time))
         log "[Step 1] run_checks duration: $(format_duration "$checks_duration")"
+        append_to_session_log "Iteration $iteration checks output (${FDR_CHECK_CMD})" "$CHECKS_LOG"
 
         # Check for oscillation (repeated identical failure output)
         current_checks_hash=$(git hash-object "$CHECKS_LOG" 2>/dev/null || echo "iteration_$iteration")
@@ -661,20 +735,44 @@ main() {
             if [[ -f "$BUILD_HISTORY_FILE" ]]; then
                 fix_checks_args+=("@$BUILD_HISTORY_FILE")
             fi
+
+            # Calculate total size of changed files to decide between PUSH (attach) and PULL (list)
+            local changed_files_size=0
             if [[ ${#changed_files[@]} -gt 0 ]]; then
+                for f in "${changed_files[@]}"; do
+                    local s
+                    s=$(wc -c < "$PROJECT_ROOT/$f" 2>/dev/null || echo 0)
+                    changed_files_size=$((changed_files_size + s))
+                done
+            fi
+
+            local context_mode="push"
+            local large_context_list=""
+            
+            if [[ $changed_files_size -gt $AUTO_ATTACH_THRESHOLD ]]; then
+                context_mode="pull"
+                log "Context size (${changed_files_size} bytes) exceeds threshold (${AUTO_ATTACH_THRESHOLD}). Switching to PULL mode (listing files only)."
+                
+                large_context_list="\n\nThe following files have changed but are too large to pre-load automatically (${changed_files_size} bytes total). You MUST use the 'read' tool to inspect the ones relevant to the error:\n"
+                for f in "${changed_files[@]}"; do
+                    large_context_list+="- $f\n"
+                done
+            else
+                log "Context size (${changed_files_size} bytes) is within limits. Pushing file contents to prompt."
                 for f in "${changed_files[@]}"; do
                     fix_checks_args+=("@$f")
                 done
             fi
 
-            # Extract error locations (file:line) and check for common Rust errors
+            # Extract error locations (file:line or file(line,col)) and check for common errors
             local error_locations=""
             local missing_field_hint=""
             
             if [[ -f "$CHECKS_FILTERED_LOG" ]]; then
-                error_locations=$(grep -oE "[a-zA-Z0-9_/.-]+:[0-9]+" "$CHECKS_FILTERED_LOG" | head -n 20 | sort -u | tr '\n' ' ')
+                # Match both colon format (file:line) and parenthesis format (file(line,col))
+                error_locations=$(grep -oE "[a-zA-Z0-9_/.-]+(:[0-9]+|\([0-9]+,[0-9]+\))" "$CHECKS_FILTERED_LOG" 2>/dev/null | head -n 20 | sort -u | tr '\n' ' ' || true)
                 
-                if grep -q "missing field" "$CHECKS_FILTERED_LOG"; then
+                if grep -q "missing field" "$CHECKS_FILTERED_LOG" 2>/dev/null; then
                      missing_field_hint="HINT: You seem to have a 'missing field' error. You likely updated a struct definition but forgot to update some initializations. Search the codebase for the struct name to find ALL usages (e.g., in tests) and update them."
                 fi
             fi
@@ -694,7 +792,12 @@ main() {
             if [[ -f "$BUILD_HISTORY_FILE" ]]; then
                  fix_checks_prompt+="I have attached .fix-die-repeat/build_history.md which contains a summary of files you modified in previous attempts to fix the build. Use this to avoid repeating ineffective changes. "
             fi
-            fix_checks_prompt+="I have also attached the currently changed files for context. "
+            
+            if [[ "$context_mode" == "push" ]]; then
+                fix_checks_prompt+="I have also attached the currently changed files for context. "
+            else
+                fix_checks_prompt+="$large_context_list"
+            fi
             
             if [[ -n "$error_locations" ]]; then
                 fix_checks_prompt+="\n\nDetected error locations: $error_locations\n"
@@ -773,17 +876,59 @@ main() {
 
             # Step 5: Run pi review
             log "[Step 5] Running pi to review files..."
+            
+            # Generate diff file
+            local diff_file="$FDR_DIR/changes.diff"
+            {
+                if [[ -n "$FDR_START_SHA" ]]; then
+                    # Diff from start SHA (covers staged + unstaged changes to tracked files)
+                    git diff "$FDR_START_SHA"
+                else
+                    # Fallback
+                    git diff HEAD
+                fi
+                
+                # Append pseudo-diff for untracked files (newly created)
+                git ls-files --others --exclude-standard | while read -r f; do
+                    if [[ -f "$f" ]] && [[ "$f" != .fix-die-repeat/* ]] && ! is_excluded_file "$f"; then
+                         echo "diff --git a/$f b/$f"
+                         echo "new file mode 100644"
+                         echo "--- /dev/null"
+                         echo "+++ b/$f"
+                         # simplistic content dump prefixed with +
+                         if file "$f" | grep -q "text"; then
+                             sed 's/^/+/' "$f"
+                         else
+                             echo "Binary file $f differs"
+                         fi
+                         echo "" 
+                    fi
+                done
+            } > "$diff_file"
+
+            local diff_size
+            diff_size=$(wc -c < "$diff_file" 2>/dev/null || echo 0)
+            log "Generated review diff size: $diff_size bytes"
+
             # Restrict tools to prevent accidental fixes (no edit/bash), but allow grep/find/ls for exploration
             pi_args=("-p" "--tools" "read,write,grep,find,ls")
-            for f in "${changed_files[@]}"; do
-                pi_args+=("@$f")
-            done
+            
+            # Decide whether to attach the diff or list it based on size
+            if [[ $diff_size -gt $AUTO_ATTACH_THRESHOLD ]]; then
+                log "Review diff size (${diff_size} bytes) exceeds threshold. Switching to PULL mode."
+                local review_prompt_prefix="The changes are too large to attach automatically (${diff_size} bytes). You MUST use the 'read' tool to inspect '.fix-die-repeat/changes.diff'.\n"
+            else
+                log "Review diff size (${diff_size} bytes) is within limits. Attaching changes.diff."
+                pi_args+=("@$diff_file")
+                local review_prompt_prefix="I have attached '.fix-die-repeat/changes.diff' which contains the changes made in this session.\n"
+            fi
+
             if [[ -f "$REVIEW_FILE" ]]; then
                 pi_args+=("@$REVIEW_FILE")
             fi
 
-            if ! run_pi_safe "${pi_args[@]}" "Review all of the provided files for issues. Use .fix-die-repeat/review.md as historical context.
-Your task is ONLY to identify and document issues. Do NOT fix them yourself.
+            if ! run_pi_safe "${pi_args[@]}" "${review_prompt_prefix}Review the changes for issues. Use .fix-die-repeat/review.md as historical context.
+Your task is ONLY to identify and document issues introduced by these changes. Do NOT fix them yourself.
 Note: You do not have access to 'edit' or 'bash', so you cannot apply fixes even if you wanted to.
 
 Classify issues as:
@@ -858,7 +1003,7 @@ If these issues are PR threads (indicated by 'Thread #ID'), use the 'resolve_pr_
         fi
         # Clean up checkpoint file on success
         rm -f "$FDR_START_SHA_FILE"
-        log "[Step 7] Done! All checks passed and no review issues found. .fix-die-repeat/review.md retained."
+        log "[Step 7] Done! All checks passed and no review issues found. .fix-die-repeat/review.md retained. Session log: $SESSION_LOG"
         exit 0
     done
 }
