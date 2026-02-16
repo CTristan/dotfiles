@@ -305,7 +305,7 @@ fetch_pr_threads() {
             echo ""
             echo "CRITICAL: For each thread below, the 'ID' is the GraphQL thread ID. You MUST use this ID with the available tools:"
             echo " - To resolve a thread after fixing: use 'resolve_pr_threads(threadIds: [\"ID_HERE\"])'"
-            echo " - To reply to a thread (e.g. to explain a 'won't fix'): use 'reply_to_thread(threadId: \"ID_HERE\", body: \"...\")'"
+            echo " - To reply to a thread (e.g. to explain a 'won't fix'): use 'reply_to_thread(threadId: \"ID_HERE\", body: \"...\")' followed by 'resolve_pr_threads(threadIds: [\"ID_HERE\"])'"
             echo ""
             echo "$threads_output"
         } > "$REVIEW_CURRENT_FILE"
@@ -713,10 +713,22 @@ main() {
             repeated_failure_warning=$(check_oscillation "$current_checks_hash")
         fi
 
-        if [[ $checks_status -eq 0 ]]; then
-            log "[Step 2B] Checks passed. Proceeding to review."
-        else
-            log "[Step 2A] Checks failed. Running pi to fix errors..."
+        # Step 2: Inner fix loop — if checks failed, keep fixing and re-checking
+        # until they pass (or we exhaust the fix attempt budget).
+        local fix_attempt=0
+        while [[ $checks_status -ne 0 ]]; do
+            fix_attempt=$((fix_attempt + 1))
+
+            if [[ $fix_attempt -gt $FDR_MAX_ITERS ]]; then
+                error "Maximum fix attempts ($FDR_MAX_ITERS) exhausted in Step 2A. Could not resolve check failures."
+                if [[ -n "$FDR_START_SHA" ]]; then
+                    error "To see all changes made: git diff $FDR_START_SHA"
+                    error "To revert all changes:   git checkout $FDR_START_SHA -- ."
+                fi
+                exit 1
+            fi
+
+            log "[Step 2A] Checks failed (fix attempt $fix_attempt/$FDR_MAX_ITERS). Running pi to fix errors..."
 
             # Filter the checks log for relevant content
             filter_checks_log
@@ -816,27 +828,48 @@ main() {
             fix_checks_prompt+="1. ANALYZE the log and identify the root cause.\n"
             fix_checks_prompt+="2. PLAN your fix.\n"
             fix_checks_prompt+="3. APPLY the fix using 'edit'.\n"
-            fix_checks_prompt+="4. VERIFY with a quick targeted check (e.g., compile the affected file, run the specific failing test). Do NOT run the full \`${FDR_CHECK_CMD}\` — the outer loop will do that."
+            fix_checks_prompt+="4. VERIFY with a quick targeted check (e.g., compile the affected file, run the specific failing test). Do NOT run the full \`${FDR_CHECK_CMD}\` — the inner loop will re-run it automatically."
 
             if ! run_pi_safe "${fix_checks_args[@]}" "$fix_checks_prompt"; then
-                log "pi could not produce a fix this iteration. Continuing to next iteration."
+                log "pi could not produce a fix on attempt $fix_attempt."
             fi
 
             # Check if any changes were actually made
             if [[ -z "$(git diff --name-only)" && -z "$(git ls-files --others --exclude-standard)" && -z "$(git diff --cached --name-only)" ]]; then
                 error "Pi reported success but NO files were modified. This suggests 'edit' commands failed (e.g., text not found)."
-                echo "## Iteration $iteration: FAILED to apply fixes (no files changed)" >> "$BUILD_HISTORY_FILE"
+                echo "## Iteration $iteration fix attempt $fix_attempt: FAILED to apply fixes (no files changed)" >> "$BUILD_HISTORY_FILE"
             else
                 # Record history
                 {
-                    echo "## Iteration $iteration Fixes"
+                    echo "## Iteration $iteration fix attempt $fix_attempt"
                     git diff --stat
                     echo ""
                 } >> "$BUILD_HISTORY_FILE"
             fi
 
-            continue
-        fi
+            # Re-run checks immediately to see if the fix worked
+            log "[Step 2A] Re-running ${FDR_CHECK_CMD} after fix attempt $fix_attempt..."
+            checks_start_time=$(date +%s)
+            if bash -c "$FDR_CHECK_CMD" > "$CHECKS_LOG" 2>&1; then
+                checks_status=0
+            else
+                checks_status=$?
+            fi
+            checks_end_time=$(date +%s)
+            checks_duration=$((checks_end_time - checks_start_time))
+            log "[Step 2A] re-check duration: $(format_duration "$checks_duration")"
+            append_to_session_log "Iteration $iteration fix attempt $fix_attempt re-check (${FDR_CHECK_CMD})" "$CHECKS_LOG"
+
+            # Update oscillation tracking for the new check output
+            if [[ $checks_status -ne 0 ]]; then
+                current_checks_hash=$(git hash-object "$CHECKS_LOG" 2>/dev/null || echo "fix_attempt_${fix_attempt}")
+                repeated_failure_warning=$(check_oscillation "$current_checks_hash")
+            else
+                repeated_failure_warning=""
+            fi
+        done
+
+        log "[Step 2B] Checks passed. Proceeding to review."
 
         # Step 3: Prepare review artifacts
         log "[Step 3] Preparing review artifacts..."
@@ -850,9 +883,19 @@ main() {
         # Step 3.5: Check PR threads if enabled
         if [[ "$FDR_PR_REVIEW" == "1" ]]; then
             log "[Step 3.5] Checking for unresolved PR threads..."
-            fetch_pr_threads
-            # Disable PR review for subsequent iterations
-            FDR_PR_REVIEW=0
+            # Retry if review_current.md is not generated and pi review hasn't run yet
+            local pr_fetch_attempt=1
+            local max_pr_fetch_attempts=3
+            while [[ $pr_fetch_attempt -le $max_pr_fetch_attempts ]]; do
+                fetch_pr_threads
+                if [[ -s "$REVIEW_CURRENT_FILE" ]]; then
+                    break
+                fi
+                log "PR threads fetch attempt $pr_fetch_attempt produced no issues. Retrying..."
+                ((pr_fetch_attempt++))
+                sleep 2
+            done
+            # Note: We keep FDR_PR_REVIEW=1 so it checks every iteration until resolved
         fi
 
         # Skip local review if we have PR threads to process
@@ -937,11 +980,12 @@ Classify issues as:
 
 IMPORTANT:
 1. ONLY report [NIT] issues if you also find [CRITICAL] issues.
-2. If you only find [NIT] issues, report 'No critical issues found' and create an empty .fix-die-repeat/review_current.md.
+2. If you only find [NIT] issues (no [CRITICAL] issues), treat this as \"no critical issues found\".
 3. If you find [CRITICAL] issues, report BOTH [CRITICAL] and [NIT] issues.
 
-If you find reportable issues, use the 'write' tool to save them to '.fix-die-repeat/review_current.md' in the project root.
-If you find NO reportable issues, use the 'write' tool to create an empty file named '.fix-die-repeat/review_current.md' in the project root."; then
+If you find [CRITICAL] issues, use the 'write' tool to save them to '.fix-die-repeat/review_current.md' in the project root.
+If you find NO [CRITICAL] issues, use the 'write' tool to create an EMPTY file named '.fix-die-repeat/review_current.md' in the project root.
+DO NOT write any text to the file if there are no critical issues — it must be empty."; then
                 log "pi review failed. Treating as no issues found."
                 touch "$REVIEW_CURRENT_FILE"
             fi
@@ -955,41 +999,85 @@ If you find NO reportable issues, use the 'write' tool to create an empty file n
             exit 1
         fi
 
+        # Safety net: Detect if review_current.md contains only "no issues" messages
+        # This handles cases where pi writes "No critical issues found" instead of an empty file
+        local review_file_is_empty=0
+        if [[ -s "$REVIEW_CURRENT_FILE" ]]; then
+            if grep -qi "No critical issues found" "$REVIEW_CURRENT_FILE" 2>/dev/null; then
+                # Count non-header, non-empty lines to verify there's no actual content
+                local content_lines
+                content_lines=$(grep -v "^#" "$REVIEW_CURRENT_FILE" | grep -v "^$" | wc -l | tr -d ' ')
+                if [[ "$content_lines" -le 1 ]]; then
+                    log "review_current.md contains only 'no issues' message (${content_lines} content lines). Treating as empty."
+                    review_file_is_empty=1
+                    # Truncate to empty file to avoid confusion in future iterations
+                    > "$REVIEW_CURRENT_FILE"
+                fi
+            fi
+        fi
+
         if [[ -s "$REVIEW_CURRENT_FILE" ]]; then
             log "[Step 6A] Issues found in .fix-die-repeat/review_current.md. Running pi to fix them..."
 
-            fix_args=("-p" "@$REVIEW_CURRENT_FILE")
-            if [[ -f "$REVIEW_FILE" ]]; then
-                fix_args+=("@$REVIEW_FILE")
-            fi
+            local fix_attempt=1
+            local max_fix_attempts=3
+            while [[ $fix_attempt -le $max_fix_attempts ]]; do
+                log "[Step 6A] Pi fix attempt $fix_attempt of $max_fix_attempts..."
+                
+                fix_args=("-p" "@$REVIEW_CURRENT_FILE")
+                if [[ -f "$REVIEW_FILE" ]]; then
+                    fix_args+=("@$REVIEW_FILE")
+                fi
 
-            if ! run_pi_safe "${fix_args[@]}" "Fix all issues documented in .fix-die-repeat/review_current.md. Address each issue mentioned in the file.
+                # Extract file paths from review_current.md and attach them as context
+                # This helps pi see the files it needs to fix.
+                while IFS= read -r line; do
+                    if [[ "$line" =~ ^File:[[:space:]]*(.+) ]]; then
+                        local context_file="${BASH_REMATCH[1]}"
+                        if [[ -f "$context_file" ]]; then
+                            fix_args+=("@$context_file")
+                        fi
+                    fi
+                done < "$REVIEW_CURRENT_FILE"
+
+                if ! run_pi_safe "${fix_args[@]}" "Fix all issues documented in .fix-die-repeat/review_current.md. Address each issue mentioned in the file.
 
 Follow this plan:
 1. READ the issues in .fix-die-repeat/review_current.md.
 2. PLAN your fixes.
-3. If an issue is a logic bug, CREATE a unit test to prevent regression.
+3. If the issue is testable, CREATE a unit test to prevent regression.
 4. APPLY the fixes using 'edit'.
 5. VERIFY with a quick targeted check (e.g., compile the affected file, run the specific failing test). Do NOT run the full \`${FDR_CHECK_CMD}\` — the outer loop will do that.
 
+CRITICAL: You MUST NOT commit your changes at any point. The script handles git operations.
+
 Ensure that your changes do not re-surface older issues listed in .fix-die-repeat/review.md.
 If these issues are PR threads (indicated by 'Thread #ID'), use the 'resolve_pr_threads' tool to mark them resolved on GitHub ONLY after verifying the fix."; then
-                log "pi fix failed. Continuing to next iteration to re-check."
-            fi
-            append_resolution_entry "Fixes applied for .fix-die-repeat/review_current.md; verification pending."
+                    log "pi fix failed on attempt $fix_attempt."
+                fi
+                append_resolution_entry "Fixes applied for .fix-die-repeat/review_current.md (attempt $fix_attempt); verification pending."
 
-            # Check if any changes were actually made
-            if [[ -z "$(git diff --name-only)" && -z "$(git ls-files --others --exclude-standard)" && -z "$(git diff --cached --name-only)" ]]; then
-                error "Pi reported success but NO files were modified. This suggests 'edit' commands failed (e.g., text not found)."
-                echo "## Iteration $iteration: Review Fixes FAILED (no files changed)" >> "$BUILD_HISTORY_FILE"
-            else
-                # Record history for review-fix changes
-                {
-                    echo "## Iteration $iteration Review Fixes"
-                    git diff --stat
-                    echo ""
-                } >> "$BUILD_HISTORY_FILE"
-            fi
+                # Check if any changes were actually made
+                if [[ -z "$(git diff --name-only)" && -z "$(git ls-files --others --exclude-standard)" && -z "$(git diff --cached --name-only)" ]]; then
+                    error "Pi reported success on attempt $fix_attempt but NO files were modified. This suggests 'edit' commands failed (e.g., text not found)."
+                    echo "## Iteration $iteration fix attempt $fix_attempt: FAILED to apply fixes (no files changed)" >> "$BUILD_HISTORY_FILE"
+                    
+                    if [[ $fix_attempt -lt $max_fix_attempts ]]; then
+                        log "Retrying fix (attempt $((fix_attempt + 1)))..."
+                        ((fix_attempt++))
+                        continue
+                    fi
+                else
+                    # Record history for review-fix changes
+                    {
+                        echo "## Iteration $iteration Review Fixes (attempt $fix_attempt)"
+                        git diff --stat
+                        echo ""
+                    } >> "$BUILD_HISTORY_FILE"
+                    break # Success!
+                fi
+                ((fix_attempt++))
+            done
 
             continue
         else
