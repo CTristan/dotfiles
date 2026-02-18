@@ -7,13 +7,15 @@
 # Options:
 #   -c, --check-cmd CMD      Command to run checks (default: ./scripts/ci.sh)
 #   -n, --max-iters N        Maximum loop iterations (default: 10)
+#   -m, --model MODEL        Override model selection (e.g., anthropic/claude-sonnet-4-5)
 #       --archive-artifacts  Archive existing artifacts to a timestamped folder
 #       --no-compact         Skip automatic compaction of large artifacts
 #       --pr-review          Enable PR review mode
+#   -d, --debug              Enable debug mode (timestamped session logs)
 #   -h, --help               Show this help message
 #
 # Environment variables:
-#   FDR_CHECK_CMD, FDR_MAX_ITERS, FDR_ARCHIVE_ARTIFACTS, FDR_COMPACT_ARTIFACTS, FDR_PR_REVIEW
+#   FDR_CHECK_CMD, FDR_MAX_ITERS, FDR_MODEL, FDR_ARCHIVE_ARTIFACTS, FDR_COMPACT_ARTIFACTS, FDR_PR_REVIEW, FDR_DEBUG
 #
 
 set -euo pipefail
@@ -21,6 +23,7 @@ set -euo pipefail
 # Defaults (can be overridden by env vars)
 FDR_CHECK_CMD="${FDR_CHECK_CMD:-./scripts/ci.sh}"
 FDR_MAX_ITERS="${FDR_MAX_ITERS:-10}"
+FDR_MODEL="${FDR_MODEL:-}"
 FDR_ARCHIVE_ARTIFACTS="${FDR_ARCHIVE_ARTIFACTS:-0}"
 FDR_COMPACT_ARTIFACTS="${FDR_COMPACT_ARTIFACTS:-1}"
 FDR_PR_REVIEW="${FDR_PR_REVIEW:-0}"
@@ -37,6 +40,8 @@ CHECKS_FILTERED_LOG="$FDR_DIR/checks_filtered.log"
 CHECKS_HASH_FILE="$FDR_DIR/.checks_hashes"
 PI_LOG="$FDR_DIR/pi.log"
 FDR_LOG="$FDR_DIR/fdr.log"
+PR_THREADS_CACHE="$FDR_DIR/.pr_threads_cache"
+PR_THREADS_HASH_FILE="$FDR_DIR/.pr_threads_hash"
 SESSION_LOG=""
 
 # Context limit: If changed files exceed this size (approx 100k tokens),
@@ -48,12 +53,23 @@ iteration=0
 FDR_START_SHA=""
 FDR_START_SHA_FILE="$FDR_DIR/.start_sha"
 
+# Track no-progress detection for PR review mode
+pr_review_no_progress_count=0
+
+# Track toolless responses (no file edits across attempts)
+consecutive_toolless_attempts=0
+
+# Track iteration state for no-progress detection
+last_review_current_hash=""
+last_git_state=""
+
 usage() {
     echo "Usage: $(basename "$0") [OPTIONS]"
     echo ""
     echo "Options:"
     echo "  -c, --check-cmd CMD      Command to run checks (default: ./scripts/ci.sh)"
     echo "  -n, --max-iters N        Maximum loop iterations (default: 10)"
+    echo "  -m, --model MODEL        Override model selection (e.g., anthropic/claude-sonnet-4-5)"
     echo "      --archive-artifacts  Archive existing artifacts to a timestamped folder"
     echo "      --no-compact         Skip automatic compaction of large artifacts"
     echo "      --pr-review          Enable PR review mode"
@@ -61,7 +77,7 @@ usage() {
     echo "  -h, --help               Show this help message"
     echo ""
     echo "Environment variables can also be used:"
-    echo "  FDR_CHECK_CMD, FDR_MAX_ITERS, FDR_ARCHIVE_ARTIFACTS, FDR_COMPACT_ARTIFACTS, FDR_PR_REVIEW, FDR_DEBUG"
+    echo "  FDR_CHECK_CMD, FDR_MAX_ITERS, FDR_MODEL, FDR_ARCHIVE_ARTIFACTS, FDR_COMPACT_ARTIFACTS, FDR_PR_REVIEW, FDR_DEBUG"
 }
 
 log() {
@@ -244,7 +260,28 @@ fetch_pr_threads() {
     repo_owner=$(echo "$pr_json" | jq -r .headRepositoryOwner.login)
     repo_name=$(echo "$pr_json" | jq -r .headRepository.name)
 
-    log "Found PR #$pr_number ($pr_url). Fetching threads..."
+    log "Found PR #$pr_number ($pr_url). Checking for cached threads..."
+
+    # Check cache for PR threads to avoid unnecessary refetches
+    if [[ -f "$PR_THREADS_CACHE" ]] && [[ -f "$PR_THREADS_HASH_FILE" ]]; then
+        local cached_hash
+        cached_hash=$(cat "$PR_THREADS_HASH_FILE" 2>/dev/null || echo "no_cache")
+
+        # Compute hash based on PR number and repo to detect changes
+        local pr_key
+        pr_key="${repo_owner}/${repo_name}/${pr_number}"
+
+        if [[ "$cached_hash" == "$pr_key" ]]; then
+            log "Using cached PR threads (unchanged)..."
+            cp "$PR_THREADS_CACHE" "$REVIEW_CURRENT_FILE"
+            local cached_count
+            cached_count=$(rg -c "^--- Thread #" "$REVIEW_CURRENT_FILE" 2>/dev/null || echo 0)
+            log "Found $cached_count unresolved threads from cache."
+            return 0
+        fi
+    fi
+
+    log "Cache miss or invalid. Fetching fresh threads..."
 
     # GraphQL query to get unresolved threads
     local query='
@@ -311,6 +348,13 @@ fetch_pr_threads() {
         } > "$REVIEW_CURRENT_FILE"
 
         log "Found $count unresolved threads. Added to review queue."
+
+        # Cache the fetched threads
+        cp "$REVIEW_CURRENT_FILE" "$PR_THREADS_CACHE"
+        # Store hash key: repo/owner/number
+        local pr_key="${repo_owner}/${repo_name}/${pr_number}"
+        echo "$pr_key" > "$PR_THREADS_HASH_FILE"
+
         return 0
     else
         log "No unresolved threads found."
@@ -319,28 +363,44 @@ fetch_pr_threads() {
 }
 
 # ---------------------------------------------------------------------------
-# Compact large persistent artifacts to preserve lessons while reducing noise
+# Check and compact large persistent artifacts to preserve lessons while reducing noise
 # ---------------------------------------------------------------------------
-maybe_compact_artifacts() {
+check_and_compact_artifacts() {
     if [[ "$FDR_COMPACT_ARTIFACTS" != "1" && "$FDR_COMPACT_ARTIFACTS" != "true" ]]; then
         return 0
     fi
 
-    local threshold_lines=200
+    local compact_threshold_lines=150
+    local emergency_threshold_lines=200
     local needs_compact=0
+    local needs_emergency=0
 
     for f in "$REVIEW_FILE" "$BUILD_HISTORY_FILE"; do
-        if [[ -f "$f" ]] && [[ $(wc -l < "$f") -gt $threshold_lines ]]; then
-            needs_compact=1
-            break
+        if [[ -f "$f" ]]; then
+            local line_count
+            line_count=$(wc -l < "$f" | tr -d ' ')
+
+            if [[ $line_count -gt $emergency_threshold_lines ]]; then
+                needs_emergency=1
+                break
+            elif [[ $line_count -gt $compact_threshold_lines ]]; then
+                needs_compact=1
+            fi
         fi
     done
 
-    if [[ "$needs_compact" -eq 0 ]]; then
+    if [[ $needs_emergency -eq 1 ]]; then
+        log "Emergency: artifacts exceed ${emergency_threshold_lines} lines. Truncating to last 100 lines..."
+        [[ -f "$REVIEW_FILE" ]] && tail -n 100 "$REVIEW_FILE" > "$REVIEW_FILE.tmp" && mv "$REVIEW_FILE.tmp" "$REVIEW_FILE"
+        [[ -f "$BUILD_HISTORY_FILE" ]] && tail -n 100 "$BUILD_HISTORY_FILE" > "$BUILD_HISTORY_FILE.tmp" && mv "$BUILD_HISTORY_FILE.tmp" "$BUILD_HISTORY_FILE"
         return 0
     fi
 
-    log "Artifacts exceed ${threshold_lines} lines. Compacting with pi..."
+    if [[ $needs_compact -eq 0 ]]; then
+        return 0
+    fi
+
+    log "Artifacts exceed ${compact_threshold_lines} lines. Compacting with pi..."
 
     local compact_args=("-p")
     [[ -f "$REVIEW_FILE" ]] && compact_args+=("@$REVIEW_FILE")
@@ -351,21 +411,51 @@ maybe_compact_artifacts() {
     [[ -f "$BUILD_HISTORY_FILE" ]] && cp "$BUILD_HISTORY_FILE" "$BUILD_HISTORY_FILE.bak"
 
     if ! run_pi_safe "${compact_args[@]}" \
-        "These are history files from previous fix-die-repeat runs. They have grown large and need compacting.
+        "These are history files from previous fix-die-repeat runs. They have grown large and need compacting to stay within Opus 4.6's ~32K token context limit.
 
-Your task: read both files and write compacted versions that preserve:
+Your task: read both files and write compacted versions that preserve ONLY:
+
 1. Key lessons learned and approaches that FAILED (and why) — these prevent repeated mistakes.
-2. Any unresolved or recurring known issues.
-3. File paths and areas that have been repeatedly problematic.
+2. Files/areas that have been repeatedly problematic.
+
+REMOVE all of the following:
+- Successful resolution entries (they don't help avoid mistakes)
+- Iteration numbers and timestamps (noise)
+- Generic \"no issues found\" entries
+- Identical PR thread descriptions from multiple iterations
 
 Write the compacted review history to '$REVIEW_FILE' and the compacted build history to '$BUILD_HISTORY_FILE'.
-Target ~50 lines each. Be concise but do NOT discard failure patterns — those are the most valuable information.
+Target **30-35 lines** each.
 If a file was not provided (doesn't exist), skip it."; then
         log "Compaction failed. Continuing with existing artifacts."
         return 0
     fi
 
+    # Verify compaction actually reduced file sizes
+    for f in "$REVIEW_FILE" "$BUILD_HISTORY_FILE"; do
+        if [[ -f "$f.bak" ]]; then
+            local before_lines
+            before_lines=$(wc -l < "$f.bak" 2>/dev/null || echo 0)
+            local after_lines
+            after_lines=$(wc -l < "$f" 2>/dev/null || echo 0)
+
+            if [[ $after_lines -ge $before_lines ]]; then
+                log "Warning: Compaction failed to reduce size of $f (${before_lines} → ${after_lines} lines). Force truncating to 50 lines..."
+                tail -n 50 "$f.bak" > "$f" 2>/dev/null || true
+            else
+                log "Compaction reduced $f from ${before_lines} to ${after_lines} lines."
+            fi
+        fi
+    done
+
     log "Compaction complete. Backups saved as .bak files in $FDR_DIR."
+}
+
+# ---------------------------------------------------------------------------
+# Compact large persistent artifacts to preserve lessons while reducing noise
+# ---------------------------------------------------------------------------
+maybe_compact_artifacts() {
+    check_and_compact_artifacts
 }
 
 # ---------------------------------------------------------------------------
@@ -409,6 +499,15 @@ run_pi_safe() {
         # Trigger model skip - this will add the failing model to the persistent cooldown file
         # We use -p to run in print mode
         pi -p "/model-skip" >/dev/null 2>&1 || true
+    fi
+
+    # Detect long context error (429) and force compaction before retry
+    if [[ -f "$PI_LOG" ]] && grep -qi "429.*long context" "$PI_LOG" >/dev/null 2>&1; then
+        log "Detected long context rate limit (429). Forcing emergency compaction..."
+        # Force emergency truncation of artifacts
+        [[ -f "$REVIEW_FILE" ]] && tail -n 100 "$REVIEW_FILE" > "$REVIEW_FILE.tmp" && mv "$REVIEW_FILE.tmp" "$REVIEW_FILE"
+        [[ -f "$BUILD_HISTORY_FILE" ]] && tail -n 100 "$BUILD_HISTORY_FILE" > "$BUILD_HISTORY_FILE.tmp" && mv "$BUILD_HISTORY_FILE.tmp" "$BUILD_HISTORY_FILE"
+        log "Emergency compaction complete. Retrying..."
     fi
 
     log "pi failed (exit $exit_code). Retrying once..."
@@ -563,6 +662,40 @@ append_resolution_entry() {
     } >> "$REVIEW_FILE"
 }
 
+play_completion_sound() {
+    # Best-effort audible notification on successful completion.
+    # Prefer calm, positive sounds over harsh/error-like alerts.
+    if command -v afplay >/dev/null 2>&1; then
+        local mac_sound
+        for mac_sound in Purr Tink Pop Glass; do
+            local sound_file="/System/Library/Sounds/${mac_sound}.aiff"
+            if [[ -f "$sound_file" ]]; then
+                afplay "$sound_file" >/dev/null 2>&1 || true
+                return 0
+            fi
+        done
+    fi
+
+    if command -v paplay >/dev/null 2>&1; then
+        local linux_sound
+        for linux_sound in complete.oga service-login.oga message.oga; do
+            local sound_file="/usr/share/sounds/freedesktop/stereo/${linux_sound}"
+            if [[ -f "$sound_file" ]]; then
+                paplay "$sound_file" >/dev/null 2>&1 || true
+                return 0
+            fi
+        done
+    fi
+
+    if command -v canberra-gtk-play >/dev/null 2>&1; then
+        canberra-gtk-play -i complete -d "fix-die-repeat" >/dev/null 2>&1 || true
+        return 0
+    fi
+
+    # Last-resort fallback if no sound player/files are available.
+    printf '\a' || true
+}
+
 main() {
     script_start_time=$(date +%s)
 
@@ -586,6 +719,16 @@ main() {
                         exit 1
                     fi
                     FDR_MAX_ITERS="$2"
+                    shift 2
+                else
+                    error "Argument for $1 is missing"
+                    usage
+                    exit 1
+                fi
+                ;;
+            -m|--model)
+                if [[ -n "${2:-}" && ! "$2" =~ ^- ]]; then
+                    FDR_MODEL="$2"
                     shift 2
                 else
                     error "Argument for $1 is missing"
@@ -682,6 +825,9 @@ main() {
     while true; do
         iteration=$((iteration + 1))
         log "===== Iteration $iteration of $FDR_MAX_ITERS ====="
+
+        # Check and compact artifacts at start of each iteration to prevent unbounded growth
+        check_and_compact_artifacts
 
         if [[ $iteration -gt $FDR_MAX_ITERS ]]; then
             error "Maximum iterations ($FDR_MAX_ITERS) exceeded. Could not resolve all issues."
@@ -1023,9 +1169,22 @@ DO NOT write any text to the file if there are no critical issues — it must be
             local max_fix_attempts=3
             while [[ $fix_attempt -le $max_fix_attempts ]]; do
                 log "[Step 6A] Pi fix attempt $fix_attempt of $max_fix_attempts..."
-                
-                fix_args=("-p" "@$REVIEW_CURRENT_FILE")
-                if [[ -f "$REVIEW_FILE" ]]; then
+
+                fix_args=("-p")
+
+                # Add model override if specified
+                if [[ -n "$FDR_MODEL" ]]; then
+                    fix_args+=("--model" "$FDR_MODEL")
+                fi
+
+                fix_args+=("@$REVIEW_CURRENT_FILE")
+
+                # In PR review mode, only attach recent history (last 50 lines) to reduce context
+                if [[ -s "$REVIEW_CURRENT_FILE" ]] && [[ -f "$REVIEW_FILE" ]]; then
+                    tail -n 50 "$REVIEW_FILE" > "$FDR_DIR/review_recent.md"
+                    fix_args+=("@$FDR_DIR/review_recent.md")
+                elif [[ -f "$REVIEW_FILE" ]]; then
+                    # Normal mode - attach full review file
                     fix_args+=("@$REVIEW_FILE")
                 fi
 
@@ -1039,6 +1198,18 @@ DO NOT write any text to the file if there are no critical issues — it must be
                         fi
                     fi
                 done < "$REVIEW_CURRENT_FILE"
+
+                # Log context size for debugging
+                local review_current_size=0 review_size=0 context_size=0
+                [[ -f "$REVIEW_CURRENT_FILE" ]] && review_current_size=$(wc -c < "$REVIEW_CURRENT_FILE" 2>/dev/null || echo 0)
+                if [[ -s "$REVIEW_CURRENT_FILE" ]] && [[ -f "$REVIEW_FILE" ]]; then
+                    review_size=$(wc -c < "$FDR_DIR/review_recent.md" 2>/dev/null || echo 0)
+                elif [[ -f "$REVIEW_FILE" ]]; then
+                    review_size=$(wc -c < "$REVIEW_FILE" 2>/dev/null || echo 0)
+                fi
+                [[ -f "$BUILD_HISTORY_FILE" ]] && context_size=$(wc -c < "$BUILD_HISTORY_FILE" 2>/dev/null || echo 0)
+                local total_context=$((review_current_size + review_size + context_size))
+                log "Context size: review_current=${review_current_size}B, review=${review_size}B, build_history=${context_size}B, total=${total_context}B (~$((total_context / 4000))K tokens)"
 
                 if ! run_pi_safe "${fix_args[@]}" "Fix all issues documented in .fix-die-repeat/review_current.md. Address each issue mentioned in the file.
 
@@ -1059,21 +1230,47 @@ If these issues are PR threads (indicated by 'Thread #ID'), use the 'resolve_pr_
 
                 # Check if any changes were actually made
                 if [[ -z "$(git diff --name-only)" && -z "$(git ls-files --others --exclude-standard)" && -z "$(git diff --cached --name-only)" ]]; then
+                    ((consecutive_toolless_attempts++))
                     error "Pi reported success on attempt $fix_attempt but NO files were modified. This suggests 'edit' commands failed (e.g., text not found)."
                     echo "## Iteration $iteration fix attempt $fix_attempt: FAILED to apply fixes (no files changed)" >> "$BUILD_HISTORY_FILE"
-                    
+
+                    # After first retry, give model a specific warning about tool usage
+                    if [[ $consecutive_toolless_attempts -ge 1 ]] && [[ $fix_attempt -lt $max_fix_attempts ]]; then
+                        log "Warning: Model is not using edit/write tools. Giving explicit warning on next attempt..."
+                        # We'll modify the prompt on the next attempt
+                    fi
+
                     if [[ $fix_attempt -lt $max_fix_attempts ]]; then
                         log "Retrying fix (attempt $((fix_attempt + 1)))..."
                         ((fix_attempt++))
                         continue
                     fi
                 else
+                    consecutive_toolless_attempts=0  # Reset on successful edit
                     # Record history for review-fix changes
                     {
                         echo "## Iteration $iteration Review Fixes (attempt $fix_attempt)"
                         git diff --stat
                         echo ""
                     } >> "$BUILD_HISTORY_FILE"
+
+                    # After PR thread resolution, re-fetch to check if all are resolved
+                    if [[ "$FDR_PR_REVIEW" == "1" ]]; then
+                        log "Re-checking PR threads after successful fix..."
+                        rm -f "$PR_THREADS_HASH_FILE"  # Invalidate cache to force refetch
+                        fetch_pr_threads
+
+                        if [[ ! -s "$REVIEW_CURRENT_FILE" ]]; then
+                            log "All PR threads have been resolved! Exiting successfully."
+                            play_completion_sound
+                            exit 0
+                        else
+                            local remaining_count
+                            remaining_count=$(rg -c "^--- Thread #" "$REVIEW_CURRENT_FILE" 2>/dev/null || echo 0)
+                            log "$remaining_count PR threads remain. Continuing to next iteration."
+                        fi
+                    fi
+
                     break # Success!
                 fi
                 ((fix_attempt++))
@@ -1085,6 +1282,29 @@ If these issues are PR threads (indicated by 'Thread #ID'), use the 'resolve_pr_
             append_resolution_entry "No issues found."
         fi
 
+        # No-progress detection for PR review mode
+        if [[ "$FDR_PR_REVIEW" == "1" ]]; then
+            local current_review_hash
+            current_review_hash=$(git hash-object "$REVIEW_CURRENT_FILE" 2>/dev/null || echo "no_file")
+            local current_git_state
+            current_git_state=$(git status --porcelain | head -c 100 | md5sum | cut -d' ' -f1 || echo "no_state")
+
+            if [[ "$current_review_hash" == "$last_review_current_hash" ]] && [[ "$current_git_state" == "$last_git_state" ]]; then
+                ((pr_review_no_progress_count++))
+                log "No progress detected in PR review mode (iteration $iteration, count: $pr_review_no_progress_count/3). Same PR threads, same git state."
+
+                if [[ $pr_review_no_progress_count -ge 3 ]]; then
+                    error "No progress made after 3 iterations in PR review mode. The PR threads cannot be auto-fixed or require human intervention."
+                    log "To see all changes made: git diff $FDR_START_SHA"
+                    exit 1
+                fi
+            else
+                pr_review_no_progress_count=0  # Reset on progress
+                last_review_current_hash="$current_review_hash"
+                last_git_state="$current_git_state"
+            fi
+        fi
+
         # Step 7: Done
         if [[ -f "$REVIEW_CURRENT_FILE" ]]; then
             rm "$REVIEW_CURRENT_FILE"
@@ -1092,6 +1312,7 @@ If these issues are PR threads (indicated by 'Thread #ID'), use the 'resolve_pr_
         # Clean up checkpoint file on success
         rm -f "$FDR_START_SHA_FILE"
         log "[Step 7] Done! All checks passed and no review issues found. .fix-die-repeat/review.md retained. Session log: $SESSION_LOG"
+        play_completion_sound
         exit 0
     done
 }
