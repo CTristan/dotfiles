@@ -24,6 +24,8 @@ set -euo pipefail
 FDR_CHECK_CMD="${FDR_CHECK_CMD:-./scripts/ci.sh}"
 FDR_MAX_ITERS="${FDR_MAX_ITERS:-10}"
 FDR_MODEL="${FDR_MODEL:-}"
+FDR_TEST_MODEL="${FDR_TEST_MODEL:-}"
+FDR_MAX_PR_THREADS="${FDR_MAX_PR_THREADS:-5}"
 FDR_ARCHIVE_ARTIFACTS="${FDR_ARCHIVE_ARTIFACTS:-0}"
 FDR_COMPACT_ARTIFACTS="${FDR_COMPACT_ARTIFACTS:-1}"
 FDR_PR_REVIEW="${FDR_PR_REVIEW:-0}"
@@ -63,6 +65,138 @@ consecutive_toolless_attempts=0
 last_review_current_hash=""
 last_git_state=""
 
+# Track PR thread IDs for safe resolution (prevent accidentally resolving unhandled threads)
+pr_thread_ids_file="$FDR_DIR/.pr_thread_ids_in_scope"
+pr_resolved_threads_file="$FDR_DIR/.resolved_threads"
+
+# Keep a minimum delay between sequential pi invocations to reduce lock
+# contention when wrapper flows trigger multiple calls back-to-back.
+PI_SEQUENTIAL_DELAY_SECONDS=1
+pi_invocation_count=0
+
+before_pi_call() {
+    if [[ $pi_invocation_count -gt 0 ]]; then
+        sleep "$PI_SEQUENTIAL_DELAY_SECONDS"
+    fi
+    pi_invocation_count=$((pi_invocation_count + 1))
+}
+
+# ---------------------------------------------------------------------------
+# Extract PR thread IDs from review_current.md for safe resolution tracking
+# ---------------------------------------------------------------------------
+extract_pr_thread_ids() {
+    if [[ ! -f "$REVIEW_CURRENT_FILE" ]]; then
+        return 0
+    fi
+
+    rg "^ID: " "$REVIEW_CURRENT_FILE" | sed 's/^ID: //' > "$pr_thread_ids_file"
+    local count
+    count=$(wc -l < "$pr_thread_ids_file" | tr -d ' ')
+    log "Extracted $count PR thread IDs from review_current.md"
+    debug_log "Thread IDs extracted: $(cat "$pr_thread_ids_file" 2>/dev/null | tr '\n' ' ')"
+}
+
+# ---------------------------------------------------------------------------
+# Call pi's resolve_pr_threads tool with specific thread IDs
+# ---------------------------------------------------------------------------
+resolve_pr_threads() {
+    local thread_ids="$1"
+
+    if [[ -z "$thread_ids" ]]; then
+        log "No thread IDs to resolve."
+        return 0
+    fi
+
+    # Format thread IDs as JSON array for pi
+    local ids_json
+    ids_json=$(echo "$thread_ids" | tr '\n' ',' | sed 's/^/["/' | sed 's/$/"]/')
+
+    log "Resolving PR threads via pi..."
+
+    before_pi_call
+    if pi -p "resolve_pr_threads(threadIds: [$ids_json])"; then
+        return 0
+    else
+        log "Warning: Failed to resolve PR threads."
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Enhanced debug logging function
+# ---------------------------------------------------------------------------
+debug_log() {
+    if [[ "$FDR_DEBUG" != "1" && "$FDR_DEBUG" != "true" ]]; then
+        return 0
+    fi
+
+    log "[DEBUG] $*"
+}
+
+# ---------------------------------------------------------------------------
+# Test model compatibility before running full loop
+# ---------------------------------------------------------------------------
+test_model() {
+    if [[ -z "$FDR_TEST_MODEL" ]]; then
+        log "No --test-model specified, skipping test."
+        return 0
+    fi
+
+    local test_file="$FDR_DIR/.model_test_result.txt"
+
+    log "===== Testing model compatibility: $FDR_TEST_MODEL ====="
+    log "Running simple write test to verify model can use pi's tools..."
+
+    # Create test prompt - ask model to write a simple string
+    before_pi_call
+    if ! pi -p --model "$FDR_TEST_MODEL" "Write 'MODEL TEST OK' to file $test_file. Do NOT use any other tools or generate pseudo-code." > "$PI_LOG" 2>&1; then
+        log "pi test invocation failed with code $?"
+        error "Model $FDR_TEST_MODEL failed basic invocation test."
+        rm -f "$test_file" 2>/dev/null || true
+        return 1
+    fi
+
+    # Check if model wrote the expected output
+    if [[ -f "$test_file" ]] && grep -q "MODEL TEST OK" "$test_file"; then
+        log "Model $FDR_TEST_MODEL PASSED tool test."
+        log "Test output: $(cat "$test_file" 2>/dev/null)"
+
+        # Clean up test file
+        rm -f "$test_file" 2>/dev/null || true
+
+        # Show model information
+        log "Model is compatible for code editing. Ready to proceed."
+        log ""
+        log "To run with this model: fix-die-repeat --model $FDR_TEST_MODEL"
+        log "Or set via env var: export FDR_MODEL=$FDR_TEST_MODEL"
+        exit 0
+    else
+        local test_output
+        test_output=$(cat "$test_file" 2>/dev/null || echo "(empty)")
+        log "Model $FDR_TEST_MODEL FAILED tool test."
+        log "Test output: $test_output"
+
+        # Check for pseudo-code or hallucinated tools
+        if rg -qi "print|IO\.puts|System\.cmd|File\.write|defmodule" "$test_file" 2>/dev/null; then
+            log "WARNING: Model generated pseudo-code instead of using pi's tools."
+            log "This model appears incompatible with pi's tool-calling interface."
+        fi
+
+        # Clean up test file
+        rm -f "$test_file" 2>/dev/null || true
+
+        log "Model $FDR_TEST_MODEL is NOT suitable for code editing tasks."
+        log ""
+        log "RECOMMENDATION: Try a different model:"
+        log "  - anthropic/claude-sonnet-4-5 (recommended for code editing)"
+        log "  - anthropic/claude-opus-4-6 (high capacity, more expensive)"
+        log "  - github-copilot/gpt-5.2-codex (good for code generation)"
+        log ""
+        log "To override: fix-die-repeat --model <model>"
+        exit 1
+    fi
+}
+
 usage() {
     echo "Usage: $(basename "$0") [OPTIONS]"
     echo ""
@@ -70,14 +204,16 @@ usage() {
     echo "  -c, --check-cmd CMD      Command to run checks (default: ./scripts/ci.sh)"
     echo "  -n, --max-iters N        Maximum loop iterations (default: 10)"
     echo "  -m, --model MODEL        Override model selection (e.g., anthropic/claude-sonnet-4-5)"
+    echo "      --max-pr-threads N   Maximum PR threads to process per iteration (default: 5)"
     echo "      --archive-artifacts  Archive existing artifacts to a timestamped folder"
     echo "      --no-compact         Skip automatic compaction of large artifacts"
     echo "      --pr-review          Enable PR review mode"
-    echo "  -d, --debug              Enable debug mode (timestamped session logs)"
+    echo "      --test-model MODEL    Test model compatibility before running (exits after test)"
+    echo "  -d, --debug              Enable debug mode (timestamped session logs and verbose logging)"
     echo "  -h, --help               Show this help message"
     echo ""
     echo "Environment variables can also be used:"
-    echo "  FDR_CHECK_CMD, FDR_MAX_ITERS, FDR_MODEL, FDR_ARCHIVE_ARTIFACTS, FDR_COMPACT_ARTIFACTS, FDR_PR_REVIEW, FDR_DEBUG"
+    echo "  FDR_CHECK_CMD, FDR_MAX_ITERS, FDR_MODEL, FDR_MAX_PR_THREADS, FDR_TEST_MODEL, FDR_ARCHIVE_ARTIFACTS, FDR_COMPACT_ARTIFACTS, FDR_PR_REVIEW, FDR_DEBUG"
 }
 
 log() {
@@ -465,6 +601,7 @@ run_pi() {
     local exit_code=0
     # Capture BOTH stdout and stderr for per-session replay, while preserving
     # normal terminal output streams.
+    before_pi_call
     pi "$@" \
         > >(tee -a "$PI_LOG" "$SESSION_LOG") \
         2> >(tee -a "$PI_LOG" "$SESSION_LOG" >&2) || exit_code=$?
@@ -498,6 +635,7 @@ run_pi_safe() {
         log "Detected model capacity error (503). Skipping current model..."
         # Trigger model skip - this will add the failing model to the persistent cooldown file
         # We use -p to run in print mode
+        before_pi_call
         pi -p "/model-skip" >/dev/null 2>&1 || true
     fi
 
@@ -748,6 +886,16 @@ main() {
                 FDR_PR_REVIEW=1
                 shift
                 ;;
+            --test-model)
+                if [[ -n "${2:-}" && ! "$2" =~ ^- ]]; then
+                    FDR_TEST_MODEL="$2"
+                    shift 2
+                else
+                    error "Argument for $1 is missing"
+                    usage
+                    exit 1
+                fi
+                ;;
             -d|--debug)
                 FDR_DEBUG=1
                 shift
@@ -771,6 +919,9 @@ main() {
     fi
 
     cd "$PROJECT_ROOT"
+
+    # Test model compatibility if requested
+    test_model
 
     # Ensure .fix-die-repeat directory exists and is gitignored
     mkdir -p "$FDR_DIR"
@@ -1044,6 +1195,37 @@ main() {
             # Note: We keep FDR_PR_REVIEW=1 so it checks every iteration until resolved
         fi
 
+        # Step 3.6: Limit PR threads to first N if requested (to avoid overwhelming model)
+        if [[ "$FDR_PR_REVIEW" == "1" ]] && [[ "${FDR_MAX_PR_THREADS:-0}" -gt 0 ]] && [[ -f "$REVIEW_CURRENT_FILE" ]]; then
+            local thread_count
+            thread_count=$(rg -c "^--- Thread #" "$REVIEW_CURRENT_FILE" 2>/dev/null || echo 0)
+            if [[ $thread_count -gt $FDR_MAX_PR_THREADS ]]; then
+                log "[Step 3.6] Limiting PR threads from $thread_count to first $FDR_MAX_PR_THREADS"
+                # Create backup of full file
+                cp "$REVIEW_CURRENT_FILE" "$REVIEW_CURRENT_FILE.bak"
+
+                # Extract first N complete threads (including all content for each thread)
+                # Use awk to extract from header through first N threads
+                awk -v max_threads="$FDR_MAX_PR_THREADS" '
+                    BEGIN { threads_found = 0 }
+                    {
+                        # Check if this line is a thread marker
+                        if (/^--- Thread #/) {
+                            threads_found++
+                            # Exit at the start of the (max+1)th thread
+                            if (threads_found > max_threads) {
+                                exit
+                            }
+                        }
+                        # Print all lines within our thread limit
+                        print
+                    }
+                ' "$REVIEW_CURRENT_FILE.bak" > "$REVIEW_CURRENT_FILE"
+
+                log "Truncated review_current.md from $thread_count to $FDR_MAX_PR_THREADS threads"
+            fi
+        fi
+
         # Skip local review if we have PR threads to process
         if [[ -s "$REVIEW_CURRENT_FILE" ]]; then
             log "[Step 4] Using PR threads from $REVIEW_CURRENT_FILE for review."
@@ -1199,6 +1381,13 @@ DO NOT write any text to the file if there are no critical issues — it must be
                     fi
                 done < "$REVIEW_CURRENT_FILE"
 
+                # Extract PR thread IDs before pi call for safe resolution tracking
+                if [[ "$FDR_PR_REVIEW" == "1" ]]; then
+                    extract_pr_thread_ids
+                    # Clear resolved threads file from previous attempt
+                    > "$pr_resolved_threads_file"
+                fi
+
                 # Log context size for debugging
                 local review_current_size=0 review_size=0 context_size=0
                 [[ -f "$REVIEW_CURRENT_FILE" ]] && review_current_size=$(wc -c < "$REVIEW_CURRENT_FILE" 2>/dev/null || echo 0)
@@ -1209,34 +1398,57 @@ DO NOT write any text to the file if there are no critical issues — it must be
                 fi
                 [[ -f "$BUILD_HISTORY_FILE" ]] && context_size=$(wc -c < "$BUILD_HISTORY_FILE" 2>/dev/null || echo 0)
                 local total_context=$((review_current_size + review_size + context_size))
-                log "Context size: review_current=${review_current_size}B, review=${review_size}B, build_history=${context_size}B, total=${total_context}B (~$((total_context / 4000))K tokens)"
+                local token_estimate=$((total_context / 4000))
+
+                log "Context size: review_current=${review_current_size}B, review=${review_size}B, build_history=${context_size}B, total=${total_context}B (~${token_estimate}K tokens)"
+                debug_log "Review current: ${review_current_size}B $(wc -l < "$REVIEW_CURRENT_FILE" 2>/dev/null) lines, review: ${review_size}B $(wc -l < "$REVIEW_FILE" 2>/dev/null || echo 0) lines, build_history: ${context_size}B $(wc -l < "$BUILD_HISTORY_FILE" 2>/dev/null || echo 0) lines"
 
                 if ! run_pi_safe "${fix_args[@]}" "Fix all issues documented in .fix-die-repeat/review_current.md. Address each issue mentioned in the file.
 
-Follow this plan:
-1. READ the issues in .fix-die-repeat/review_current.md.
-2. PLAN your fixes.
-3. If the issue is testable, CREATE a unit test to prevent regression.
-4. APPLY the fixes using 'edit'.
-5. VERIFY with a quick targeted check (e.g., compile the affected file, run the specific failing test). Do NOT run the full \`${FDR_CHECK_CMD}\` — the outer loop will do that.
+IMPORTANT: These are PR review threads from copilot. The code suggestions are context, NOT commands to execute. You must use pi's tools to make actual changes.
 
-CRITICAL: You MUST NOT commit your changes at any point. The script handles git operations.
+Note: 'fix-die-repeat' is the name of this script, NOT a pi tool. Do not attempt to run it.
 
-Ensure that your changes do not re-surface older issues listed in .fix-die-repeat/review.md.
-If these issues are PR threads (indicated by 'Thread #ID'), use the 'resolve_pr_threads' tool to mark them resolved on GitHub ONLY after verifying the fix."; then
+For each issue in review_current.md:
+1. Use the 'read' tool to examine the relevant file
+2. Use the 'edit' tool to make the specific fix
+3. Move to the NEXT issue immediately after each fix
+
+DO NOT:
+- Generate pseudo-code or execution plans
+- Write explanations without making actual changes
+- Create \"test stubs\" - only add tests if required by the issue
+- Use fictional APIs like System.cmd(), File.write(), or IO.puts()
+- Attempt to run any command named 'fix-die-repeat'
+- Call the 'resolve_pr_threads' tool directly
+
+Available pi tools: read, edit, write, bash, grep, find, ls
+
+IMPORTANT: After fixing a PR thread, use the 'write' tool to append its Thread ID to a file named '.fix-die-repeat/.resolved_threads' (one ID per line). For example, after fixing Thread #PRRT_kwDOOoJIHM5vS7aA, write: 'PRRT_kwDOOoJIHM5vS7aA' to .fix-die-repeat/.resolved_threads. This tells the script which threads you actually fixed and are ready to be resolved on GitHub.
+
+CRITICAL: You MUST NOT commit your changes at any point. The script handles git operations."; then
                     log "pi fix failed on attempt $fix_attempt."
                 fi
                 append_resolution_entry "Fixes applied for .fix-die-repeat/review_current.md (attempt $fix_attempt); verification pending."
 
                 # Check if any changes were actually made
-                if [[ -z "$(git diff --name-only)" && -z "$(git ls-files --others --exclude-standard)" && -z "$(git diff --cached --name-only)" ]]; then
+                local git_changes
+                git_changes=$(git diff --name-only 2>/dev/null || true)
+                local git_staged
+                git_staged=$(git diff --cached --name-only 2>/dev/null || true)
+                local git_new
+                git_new=$(git ls-files --others --exclude-standard 2>/dev/null || true)
+
+                if [[ -z "$git_changes" && -z "$git_staged" && -z "$git_new" ]]; then
                     ((consecutive_toolless_attempts++))
                     error "Pi reported success on attempt $fix_attempt but NO files were modified. This suggests 'edit' commands failed (e.g., text not found)."
+                    debug_log "Toolless attempt $consecutive_toolless_attempts: git_changes=[$git_changes], git_staged=[$git_staged], git_new=[$git_new]"
                     echo "## Iteration $iteration fix attempt $fix_attempt: FAILED to apply fixes (no files changed)" >> "$BUILD_HISTORY_FILE"
 
                     # After first retry, give model a specific warning about tool usage
                     if [[ $consecutive_toolless_attempts -ge 1 ]] && [[ $fix_attempt -lt $max_fix_attempts ]]; then
                         log "Warning: Model is not using edit/write tools. Giving explicit warning on next attempt..."
+                        debug_log "Model may be generating pseudo-code instead of using pi tools. Consecutive toolless: $consecutive_toolless_attempts"
                         # We'll modify the prompt on the next attempt
                     fi
 
@@ -1247,6 +1459,7 @@ If these issues are PR threads (indicated by 'Thread #ID'), use the 'resolve_pr_
                     fi
                 else
                     consecutive_toolless_attempts=0  # Reset on successful edit
+                    debug_log "Files modified: git_changes=[$git_changes], git_staged=[$git_staged], git_new=[$git_new]"
                     # Record history for review-fix changes
                     {
                         echo "## Iteration $iteration Review Fixes (attempt $fix_attempt)"
@@ -1254,20 +1467,63 @@ If these issues are PR threads (indicated by 'Thread #ID'), use the 'resolve_pr_
                         echo ""
                     } >> "$BUILD_HISTORY_FILE"
 
-                    # After PR thread resolution, re-fetch to check if all are resolved
+                    # After PR thread resolution, resolve threads that model reported as fixed
                     if [[ "$FDR_PR_REVIEW" == "1" ]]; then
-                        log "Re-checking PR threads after successful fix..."
-                        rm -f "$PR_THREADS_HASH_FILE"  # Invalidate cache to force refetch
-                        fetch_pr_threads
+                        if [[ -f "$pr_resolved_threads_file" ]] && [[ -s "$pr_resolved_threads_file" ]]; then
+                            log "Model reported $(wc -l < "$pr_resolved_threads_file" | tr -d ' ') resolved thread(s)."
 
-                        if [[ ! -s "$REVIEW_CURRENT_FILE" ]]; then
-                            log "All PR threads have been resolved! Exiting successfully."
-                            play_completion_sound
-                            exit 0
+                            # Verify all resolved IDs were in our original scope
+                            local resolved_ids
+                            resolved_ids=$(cat "$pr_resolved_threads_file" | sort -u || true)
+                            local in_scope_ids
+                            in_scope_ids=$(cat "$pr_thread_ids_file")
+                            local safe_resolved_ids
+                            safe_resolved_ids=$(comm -12 <(echo "$resolved_ids" | sort) <(echo "$in_scope_ids" | sort) || true)
+
+                            if [[ -n "$safe_resolved_ids" ]]; then
+                                local unsafe_count
+                                unsafe_count=$(echo "$resolved_ids" | wc -l | tr -d ' ')
+                                local safe_count
+                                safe_count=$(echo "$safe_resolved_ids" | wc -l | tr -d ' ')
+
+                                if [[ $safe_count -lt $unsafe_count ]]; then
+                                    local unsafe_ids
+                                    unsafe_ids=$(comm -13 <(echo "$resolved_ids" | sort) <(echo "$in_scope_ids" | sort) || true)
+                                    log "WARNING: Model reported $(echo "$unsafe_ids" | wc -l | tr -d ' ') thread(s) NOT in scope: $(echo "$unsafe_ids" | tr '\n' ', ' | sed 's/,$//')"
+                                    log "Only resolving the $safe_count in-scope thread(s)."
+                                fi
+
+                                # Resolve only the safe IDs
+                                local safe_resolved_formatted
+                                safe_resolved_formatted=$(echo "$safe_resolved_ids" | tr '\n' ',' | sed 's/^/["/' | sed 's/$/"]/')
+
+                                log "Calling resolve_pr_threads on safe IDs: $safe_resolved_formatted"
+                                if resolve_pr_threads "$safe_resolved_formatted"; then
+                                    log "Successfully resolved $safe_count thread(s)."
+                                    # Invalidate cache and refetch to verify
+                                    rm -f "$PR_THREADS_HASH_FILE"
+                                    fetch_pr_threads
+
+                                    if [[ ! -s "$REVIEW_CURRENT_FILE" ]]; then
+                                        log "All PR threads have been resolved! Exiting successfully."
+                                        play_completion_sound
+                                        exit 0
+                                    else
+                                        local remaining_count
+                                        remaining_count=$(rg -c "^--- Thread #" "$REVIEW_CURRENT_FILE" 2>/dev/null || echo 0)
+                                        log "$remaining_count PR threads remain. Continuing to next iteration."
+                                    fi
+                                else
+                                    log "Warning: Failed to resolve some threads. Continuing to next iteration."
+                                fi
+                            else
+                                log "No in-scope threads were reported as resolved. Continuing to next iteration."
+                            fi
+
+                            # Clear resolved threads file for next attempt
+                            > "$pr_resolved_threads_file"
                         else
-                            local remaining_count
-                            remaining_count=$(rg -c "^--- Thread #" "$REVIEW_CURRENT_FILE" 2>/dev/null || echo 0)
-                            log "$remaining_count PR threads remain. Continuing to next iteration."
+                            log "No threads were reported as resolved. Continuing to next iteration."
                         fi
                     fi
 
@@ -1292,6 +1548,7 @@ If these issues are PR threads (indicated by 'Thread #ID'), use the 'resolve_pr_
             if [[ "$current_review_hash" == "$last_review_current_hash" ]] && [[ "$current_git_state" == "$last_git_state" ]]; then
                 ((pr_review_no_progress_count++))
                 log "No progress detected in PR review mode (iteration $iteration, count: $pr_review_no_progress_count/3). Same PR threads, same git state."
+                debug_log "Review hash: ${current_review_hash:0:15}, Git state: ${current_git_state:0:15}, Last review hash: ${last_review_current_hash:0:15}, Last git state: ${last_git_state:0:15}"
 
                 if [[ $pr_review_no_progress_count -ge 3 ]]; then
                     error "No progress made after 3 iterations in PR review mode. The PR threads cannot be auto-fixed or require human intervention."
