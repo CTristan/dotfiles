@@ -69,6 +69,9 @@ last_git_state=""
 pr_thread_ids_file="$FDR_DIR/.pr_thread_ids_in_scope"
 pr_resolved_threads_file="$FDR_DIR/.resolved_threads"
 
+# Track changed files array (must be initialized for set -u)
+changed_files=()
+
 # Keep a minimum delay between sequential pi invocations to reduce lock
 # contention when wrapper flows trigger multiple calls back-to-back.
 PI_SEQUENTIAL_DELAY_SECONDS=1
@@ -751,7 +754,13 @@ detect_large_files_warning() {
     local warning=""
     local found_large=0
 
+    # Handle empty array (bash 3.2 compatibility)
+    [[ $# -eq 0 ]] && return 0
+
     for f in "$@"; do
+        # Skip empty arguments from bash 3.2 empty array expansion
+        [[ -z "$f" ]] && continue
+
         if [[ -f "$PROJECT_ROOT/$f" ]]; then
             local lines
             lines=$(wc -l < "$PROJECT_ROOT/$f" | tr -d ' ')
@@ -1061,16 +1070,20 @@ main() {
             if [[ $changed_files_size -gt $AUTO_ATTACH_THRESHOLD ]]; then
                 context_mode="pull"
                 log "Context size (${changed_files_size} bytes) exceeds threshold (${AUTO_ATTACH_THRESHOLD}). Switching to PULL mode (listing files only)."
-                
+
                 large_context_list="\n\nThe following files have changed but are too large to pre-load automatically (${changed_files_size} bytes total). You MUST use the 'read' tool to inspect the ones relevant to the error:\n"
-                for f in "${changed_files[@]}"; do
-                    large_context_list+="- $f\n"
-                done
+                if [[ ${#changed_files[@]} -gt 0 ]]; then
+                    for f in "${changed_files[@]}"; do
+                        large_context_list+="- $f\n"
+                    done
+                fi
             else
                 log "Context size (${changed_files_size} bytes) is within limits. Pushing file contents to prompt."
-                for f in "${changed_files[@]}"; do
-                    fix_checks_args+=("@$f")
-                done
+                if [[ ${#changed_files[@]} -gt 0 ]]; then
+                    for f in "${changed_files[@]}"; do
+                        fix_checks_args+=("@$f")
+                    done
+                fi
             fi
 
             # Extract error locations (file:line or file(line,col)) and check for common errors
@@ -1088,7 +1101,11 @@ main() {
 
             # Check for large files
             local large_file_warning
-            large_file_warning=$(detect_large_files_warning "${changed_files[@]}")
+            if [[ ${#changed_files[@]} -gt 0 ]]; then
+                large_file_warning=$(detect_large_files_warning "${changed_files[@]}")
+            else
+                large_file_warning=""
+            fi
 
             # Construct prompt for fix step
             fix_checks_prompt="The file .fix-die-repeat/checks_filtered.log contains the failure output from \`${FDR_CHECK_CMD}\` (filtered to error-relevant lines; full log is in .fix-die-repeat/checks.log). "
