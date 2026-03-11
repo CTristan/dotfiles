@@ -8,7 +8,7 @@
     <key>ProgramArguments</key>
     <array>
       <string>/bin/zsh</string>
-      <string>home/dot_local/bin/mount_claude_readonly_paths.zsh</string>
+      <string>/Users/chris/bin/mount_claude_readonly_paths.zsh</string>
     </array>
 
     <key>RunAtLoad</key>
