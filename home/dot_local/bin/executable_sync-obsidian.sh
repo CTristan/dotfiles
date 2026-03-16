@@ -15,7 +15,7 @@ ICLOUD_OBSIDIAN_ROOT="${ICLOUD_OBSIDIAN_ROOT:-$HOME/Library/Mobile Documents/iCl
 VAULT_NAME="${VAULT_NAME:-}"
 
 # Where the mirror lands — stable path so tools can find it across sessions
-MIRROR_ROOT="${MIRROR_ROOT:-$HOME/.local/share/obsidian-mirror}"
+MIRROR_ROOT="${MIRROR_ROOT:-$HOME/claude}"
 
 # Set to 1 to force-download evicted iCloud files before syncing
 DOWNLOAD_EVICTED="${DOWNLOAD_EVICTED:-1}"
