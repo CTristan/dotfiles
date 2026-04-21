@@ -1,1 +1,16 @@
 .DS_Store
+
+# Editor / tooling
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Common accidental-commit hazards
+.env
+.env.local
+*.pem
+*.key
+id_rsa
+id_ed25519
