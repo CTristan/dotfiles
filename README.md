@@ -1,18 +1,17 @@
 # dotfiles
 
-Personal macOS dotfiles managed with [chezmoi](https://www.chezmoi.io/). Source of truth for `.zshrc`, `.gitconfig`, the Brave Search env template (Bitwarden-backed), the Obsidian → local-mirror sync script + LaunchAgent, and an age-encrypted `~/.claude/CLAUDE.md`.
+Personal macOS dotfiles managed with [chezmoi](https://www.chezmoi.io/). Source of truth for `.zshrc`, `.gitconfig`, and the Brave Search env template (Bitwarden-backed).
+
+> Claude Code config — `~/.claude/` (including `CLAUDE.md`, skills, and scripts) — lives in the **separate private** repo [`CTristan/dotclaude`](https://github.com/CTristan/dotclaude), **not here**. This public repo only manages portable machine dotfiles.
 
 ## What's inside
 
 | Path (rendered)                                  | Purpose                                                         |
 | ------------------------------------------------ | --------------------------------------------------------------- |
-| `~/.zshrc`                                       | Oh My Zsh + Dracula, PATH, Secretive SSH agent, pnpm/bun shims  |
+| `~/.zshrc`                                       | Oh My Zsh + Dracula, PATH, Secretive SSH agent, pnpm/bun shims, `claude` wrapper |
 | `~/.gitconfig`                                   | git LFS, SSH commit signing, include for `~/.config/git/config.local` |
 | `~/.chezmoi.toml`                                | chezmoi config — editor = `code`, Bitwarden unlock = auto        |
-| `~/.config/brave-search/env.sh`                  | Brave API key from Bitwarden (template)                          |
-| `~/.local/bin/sync-obsidian.sh`                  | Mirrors the iCloud Obsidian vault → `~/claude/<vault>/`          |
-| `~/Library/LaunchAgents/com.user.obsidian-mirror.plist` | Runs the sync every 5 min                                 |
-| `~/.claude/CLAUDE.md`                            | Age-encrypted private Claude instructions                        |
+| `~/.config/brave-search/env.sh`                  | Brave API key from Bitwarden (template, fault-tolerant, mode 0600) |
 
 ## Restoring to a new Mac
 
@@ -29,57 +28,44 @@ Then follow the on-screen instructions to add `brew` to your PATH (needed for th
 ### 2. Install the tools chezmoi depends on
 
 ```sh
-brew install chezmoi age bitwarden-cli
+brew install chezmoi bitwarden-cli jq
 brew install --cask secretive
 ```
 
 - `chezmoi` applies the dotfiles.
-- `age` decrypts `encrypted_CLAUDE.md.age`.
-- `bitwarden-cli` (`bw`) renders the Brave Search env template.
-- `Secretive` provides the SSH agent socket used for both git commit signing and auth (see `dot_zshrc:42`).
+- `bitwarden-cli` (`bw`) + `jq` render the Brave Search env template.
+- `Secretive` provides the SSH agent socket used for both git commit signing and auth (see `dot_zshrc`).
 
-### 3. Set up Bitwarden
+### 3. Set up Bitwarden (for the Brave Search key)
 
 ```sh
 bw login           # one-time, stores a session
 export BW_SESSION="$(bw unlock --raw)"
 ```
 
-Create (or confirm you already have) the following vault items before applying:
+Create (or confirm you already have) the following vault item:
 
 | Item name      | Field   | Consumed by                                |
 | -------------- | ------- | ------------------------------------------ |
 | `Brave Search` | `token` | `~/.config/brave-search/env.sh` (API key)  |
 
-If an item is missing, template rendering fails loudly and chezmoi will tell you which file.
+The template is **fault-tolerant**: a locked/missing vault renders an *empty* key instead of aborting `chezmoi apply`. So export `BW_SESSION` (unlocked) **before** applying if you want the key actually written; otherwise re-run `chezmoi apply` once the vault is unlocked.
 
-### 4. Restore the age identity
+### 4. Provision the SSH signing key
 
-`~/.config/chezmoi/chezmoi.toml` on the old Mac points at an age identity file (typically `~/.config/chezmoi/key.txt`). That file is **not** in this repo by design. On the new Mac, recover it from your password manager or encrypted backup and drop it at the same path. Without it, `encrypted_CLAUDE.md.age` won't decrypt.
+`.gitconfig` signs commits via SSH using the Secretive agent. The signer is a **hardware-backed key that requires a physical tap** — on this machine a Secure Enclave / Touch ID key via Secretive (`ecdsa-sha2-nistp256`); a Yubikey-resident key (often `ssh-ed25519`) works the same way.
 
-Verify with:
-
-```sh
-age --decrypt -i ~/.config/chezmoi/key.txt \
-    ~/.local/share/chezmoi/home/dot_claude/encrypted_CLAUDE.md.age \
-    | head
-```
-
-### 5. Provision the SSH signing key
-
-`.gitconfig` signs commits via SSH using the Secretive agent.
-
-1. Open Secretive → create (or import) an ed25519 signing key. If you want hardware-backed signing, back it with the Yubikey's Secure Enclave equivalent via Secretive's settings.
+1. Open Secretive → create (or import) a signing key. For Secure-Enclave/Touch-ID signing it'll be an `ecdsa-sha2-nistp256` key; for a Yubikey use whatever the key provides (commonly `ed25519`).
 2. Add the **public** key to GitHub → Settings → SSH and GPG keys, type = **Signing Key**. Add it a second time as an **Authentication Key** if you want to use it for `git push` over SSH.
-3. Create `~/.config/git/allowed_signers` (not tracked here — sensitive-ish) with one line:
+3. Create `~/.config/git/allowed_signers` (not tracked here — sensitive-ish) with one line matching your key's type, e.g.:
 
    ```
-   1764856+CTristan@users.noreply.github.com ssh-ed25519 AAAA…your-pubkey…
+   1764856+CTristan@users.noreply.github.com ecdsa-sha2-nistp256 AAAA…your-pubkey…
    ```
 
-4. Optionally create `~/.config/git/config.local` for any machine-local overrides (`[user]` section variations, work repos, etc.). It's pulled in via the `[include] path` at the bottom of `.gitconfig`.
+4. Optionally create `~/.config/git/config.local` for any machine-local overrides (the `[user] signingkey` path, work repos, etc.). It's pulled in via the `[include] path` at the bottom of `.gitconfig`.
 
-### 6. Install Oh My Zsh + the Dracula theme
+### 5. Install Oh My Zsh + the Dracula theme
 
 `.zshrc` expects Oh My Zsh at `$HOME/.oh-my-zsh`, with `ZSH_THEME="dracula"`.
 
@@ -89,34 +75,32 @@ git clone https://github.com/dracula/zsh.git ~/.oh-my-zsh/themes/dracula-src
 ln -s ~/.oh-my-zsh/themes/dracula-src/dracula.zsh-theme ~/.oh-my-zsh/themes/dracula.zsh-theme
 ```
 
-### 7. Apply the dotfiles
+### 6. Apply the dotfiles
 
 ```sh
 chezmoi init --apply https://github.com/CTristan/dotfiles.git
 ```
 
-This clones the repo to `~/.local/share/chezmoi`, renders all templates (Bitwarden + age), and writes files into `$HOME`. Re-run `chezmoi apply` any time secrets or templates change.
+This clones the repo to `~/.local/share/chezmoi`, renders the templates, and writes files into `$HOME`. Re-run `chezmoi apply` any time secrets or templates change.
 
 Sanity-check:
 
 ```sh
 chezmoi doctor
-chezmoi diff        # should print nothing
+chezmoi diff        # should print nothing (env.sh may diff if BW_SESSION isn't set)
 ```
 
-### 8. Load the Obsidian sync LaunchAgent
+### 7. Clone the private Claude Code repo
 
-chezmoi drops the plist at `~/Library/LaunchAgents/com.user.obsidian-mirror.plist`, but launchd won't run it until you tell it to:
+`~/.claude/` (and the `claude` shell wrapper that `.zshrc` defines) lives in the separate **private** repo, not in chezmoi:
 
 ```sh
-launchctl bootstrap "gui/$UID" ~/Library/LaunchAgents/com.user.obsidian-mirror.plist
-launchctl kickstart -k "gui/$UID/com.user.obsidian-mirror"   # run it once immediately
-tail -f /tmp/obsidian-mirror.log                             # verify output
+git clone https://github.com/CTristan/dotclaude.git ~/.claude
 ```
 
-Also: sign into iCloud and enable Obsidian iCloud sync so `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/<vault>/` actually exists. If you have multiple vaults, export `VAULT_NAME` in the LaunchAgent or your shell before the script runs.
+The `claude()` function in `.zshrc` falls back to the real `claude` binary until this is present, so the shell won't break if you skip it.
 
-### 9. Install optional runtimes referenced by PATH
+### 8. Install optional runtimes referenced by PATH
 
 `.zshrc` prepends these to PATH whether or not they exist. Install whichever you want:
 
@@ -127,12 +111,11 @@ brew install oven-sh/bun/bun         # ~/.bun/bin
 brew install python                  # backs the `python=python3` alias
 ```
 
-### 10. Verify
+### 9. Verify
 
 - New shell: `exec zsh` — Dracula theme loads, no errors.
-- Git signing: `git -C some-repo commit --allow-empty -m test` — Secretive taps/confirms.
-- Obsidian mirror: `ls ~/claude/<vault>/` populated after a few minutes.
-- Brave API: `echo $BRAVE_API_KEY` in a fresh shell — set to the Bitwarden value.
+- Git signing: `git -C some-repo commit --allow-empty -m test` — Secretive/Touch ID (or your Yubikey) prompts for a tap.
+- Brave API: `echo $BRAVE_API_KEY` in a fresh shell — set to the Bitwarden value (if the vault was unlocked at apply time).
 
 ## Updating the dotfiles from another Mac
 

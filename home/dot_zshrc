@@ -52,3 +52,16 @@ esac
 
 # bun
 export PATH="$HOME/.bun/bin:$PATH"
+
+# --- Claude Code ---
+# Route `claude` through a wrapper that picks --model from cached quota pace.
+# Falls back to the real `claude` binary if the wrapper isn't present yet — e.g.
+# on a fresh machine before the private dotclaude repo is cloned into ~/.claude.
+claude() {
+  local wrapper="$HOME/.claude/scripts/claude-wrapper.sh"
+  if [[ -x "$wrapper" ]]; then
+    bash "$wrapper" "$@"
+  else
+    command claude "$@"
+  fi
+}

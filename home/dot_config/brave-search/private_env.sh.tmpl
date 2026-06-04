@@ -1,0 +1,15 @@
+{{- /*
+  Fault-tolerant Brave Search key. A locked or missing Bitwarden vault yields an
+  EMPTY key instead of aborting all of `chezmoi apply` (the old inline
+  `bitwardenFields` call threw "unexpected end of JSON input" and broke the whole
+  tree). The real key is populated only when `bw` is logged in AND unlocked
+  (BW_SESSION exported, or an active session) — so unlock your vault before
+  `chezmoi apply` if you want the key written; otherwise it renders empty.
+  The `private_` filename prefix makes the rendered ~/.config/brave-search/env.sh
+  mode 0600.
+*/ -}}
+{{- $key := "" -}}
+{{- if lookPath "bw" -}}
+{{-   $key = output "bash" "-c" "bw get item 'Brave Search' 2>/dev/null | jq -r '.fields[]? | select(.name==\"token\") | .value' 2>/dev/null || true" | trim -}}
+{{- end -}}
+export BRAVE_API_KEY={{ $key | quote }}

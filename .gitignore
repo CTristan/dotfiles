@@ -14,3 +14,12 @@
 *.key
 id_rsa
 id_ed25519
+
+# Secrets that *.key does NOT match — this repo is PUBLIC.
+# The age private identity must never land here (it decrypts every encrypted_*.age blob).
+key.txt
+*identity*
+*.age.key
+# chezmoi local config / state (may carry secrets or machine-specific paths)
+chezmoi.toml
+chezmoistate.boltdb
