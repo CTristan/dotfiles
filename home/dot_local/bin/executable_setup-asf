@@ -1,0 +1,83 @@
+#!/bin/zsh
+# One-shot, idempotent ArchiSteamFarm installer/restorer for a new/separate Mac.
+# Managed by chezmoi (CTristan/dotfiles) — contains NO secrets.
+# Run after `chezmoi apply`, or straight from iCloud: zsh ~/.../ASF-Backups/setup-asf.sh
+# Safe to re-run: each step is a no-op if already satisfied.
+set -euo pipefail
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
+ASF_DIR="$HOME/Library/Application Support/ArchiSteamFarm"
+BACKUPS="$HOME/Library/Mobile Documents/com~apple~CloudDocs/ASF-Backups"
+LABEL_SVC=com.user.archisteamfarm
+LABEL_BAK=com.user.asf-backup
+PLIST_SVC="$HOME/Library/LaunchAgents/$LABEL_SVC.plist"
+PLIST_BAK="$HOME/Library/LaunchAgents/$LABEL_BAK.plist"
+GUI="gui/$(id -u)"
+
+say() { echo "==> $*"; }
+
+mkdir -p "$ASF_DIR" "$HOME/Library/Logs" "$HOME/Library/LaunchAgents"
+
+# 1. ASF binary — fetch the latest native build if missing (it self-updates thereafter).
+if [ -x "$ASF_DIR/ArchiSteamFarm" ]; then
+  say "ASF binary already present — skipping download."
+else
+  say "Downloading latest ASF (osx-arm64)…"
+  tmp="$(mktemp -d)"
+  if command -v gh >/dev/null 2>&1; then
+    ( cd "$tmp" && gh release download --repo JustArchiNET/ArchiSteamFarm --pattern 'ASF-osx-arm64.zip' )
+  else
+    url="$(curl -fsSL https://api.github.com/repos/JustArchiNET/ArchiSteamFarm/releases/latest \
+           | awk -F'"' '/browser_download_url/ && /ASF-osx-arm64\.zip/ {print $4; exit}')"
+    [ -n "$url" ] || { echo "could not resolve ASF download URL"; exit 1; }
+    curl -fsSL -o "$tmp/ASF-osx-arm64.zip" "$url"
+  fi
+  ditto -xk "$tmp/ASF-osx-arm64.zip" "$tmp/unzipped"
+  src="$tmp/unzipped"
+  [ -d "$src/ASF-osx-arm64" ] && src="$src/ASF-osx-arm64"
+  cp -Rp "$src/." "$ASF_DIR/"
+  chmod +x "$ASF_DIR/ArchiSteamFarm"
+  xattr -d com.apple.quarantine "$ASF_DIR/ArchiSteamFarm" 2>/dev/null || true
+  rm -rf "$tmp"
+  say "ASF binary installed."
+fi
+
+# 2. Backup passphrase in Keychain (paste from your password manager if absent).
+if security find-generic-password -s asf-backup -w >/dev/null 2>&1; then
+  say "Backup passphrase already in Keychain."
+else
+  printf 'Paste the ASF backup passphrase (from your password manager); input hidden: ' >&2
+  stty -echo; IFS= read -r pw; stty echo; echo >&2
+  [ -n "$pw" ] || { echo "empty passphrase — aborting"; exit 1; }
+  security add-generic-password -a "$USER" -s asf-backup -l "ASF config backup passphrase" -T /usr/bin/security -U -w "$pw"
+  unset pw
+  say "Passphrase stored in Keychain."
+fi
+
+# 3. Restore newest config snapshot if config/ is not already present.
+if [ -f "$ASF_DIR/config/ASF.json" ]; then
+  say "config/ already present — not overwriting (restore skipped)."
+else
+  newest="$(find "$BACKUPS" -maxdepth 1 -type f -name 'asf-config-*.tar.gz.enc' 2>/dev/null | sort -r | head -1)"
+  if [ -z "$newest" ]; then
+    say "No snapshot in $BACKUPS yet. If iCloud hasn't synced, run:"
+    say "  brctl download \"$BACKUPS\"   # then re-run this script"
+  else
+    say "Restoring newest snapshot: ${newest##*/}"
+    pw="$(security find-generic-password -s asf-backup -w)"
+    PW="$pw" openssl enc -d -aes-256-cbc -pbkdf2 -pass env:PW -in "$newest" | tar -xzf - -C "$ASF_DIR"
+    unset pw PW
+    say "config/ restored."
+  fi
+fi
+
+# 4. (Re)load both LaunchAgents — idempotent.
+for pl in "$PLIST_SVC" "$PLIST_BAK"; do
+  [ -f "$pl" ] || { say "WARN: $pl missing — run 'chezmoi apply' first."; continue; }
+  label="$(basename "${pl%.plist}")"
+  launchctl bootout "$GUI/$label" 2>/dev/null || true
+  launchctl bootstrap "$GUI" "$pl"
+  say "loaded $label"
+done
+
+say "Done. Verify with:  launchctl print $GUI/$LABEL_SVC"
