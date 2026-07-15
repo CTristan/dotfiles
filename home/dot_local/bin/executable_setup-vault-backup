@@ -1,0 +1,123 @@
+#!/bin/zsh
+# One-shot, idempotent installer for the Obsidian vault git backup on a new/separate Mac.
+# Managed by chezmoi (CTristan/dotfiles) — contains NO secrets.
+# Run after `chezmoi apply`. Safe to re-run: each step is a no-op if already satisfied.
+#
+# What it sets up: a detached git dir (worktree -> the iCloud vault) that the
+# hourly com.user.vault-backup LaunchAgent snapshots into the private
+# personal-vault repo. Auth is the gh keyring token over HTTPS; the FDA-bearing
+# helper is compiled here (see vault-backup-helper.c for why a compiled shim).
+set -euo pipefail
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin
+
+VAULT="${VAULT_BACKUP_WORKTREE:-$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Personal}"
+GDIR="${VAULT_BACKUP_GIT_DIR:-$HOME/.local/state/vault-backup.git}"
+REPO_URL="https://github.com/CTristan/personal-vault.git"
+BRANCH=main
+LABEL=com.user.vault-backup
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+GUI="gui/$(id -u)"
+HELPER_SRC="$HOME/.local/share/vault-backup/vault-backup-helper.c"
+HELPER_BIN="$HOME/.local/bin/vault-backup-helper"
+
+say()  { echo "==> $*"; }
+warn() { echo "==> WARN: $*" >&2; }
+
+mkdir -p "$HOME/.local/bin" "$HOME/.local/state" "$HOME/Library/Logs" "$HOME/Library/LaunchAgents"
+
+# 1. Preflight — every tool the unattended job depends on.
+command -v git   >/dev/null 2>&1 || { echo "git not found"; exit 1; }
+command -v clang >/dev/null 2>&1 || { echo "clang not found — install the Xcode Command Line Tools: xcode-select --install"; exit 1; }
+command -v gh    >/dev/null 2>&1 || { echo "gh not found — install: brew install gh"; exit 1; }
+gh auth status >/dev/null 2>&1   || { echo "gh not authenticated — run: gh auth login"; exit 1; }
+[ -f "$HELPER_SRC" ] || { echo "helper source missing: $HELPER_SRC — run 'chezmoi apply' first"; exit 1; }
+[ -f "$PLIST" ]      || { echo "LaunchAgent plist missing: $PLIST — run 'chezmoi apply' first"; exit 1; }
+
+# 2. Compile the FDA helper — only when missing or the source is newer.
+#    A rebuild changes the ad-hoc signature, which macOS treats as a new identity,
+#    so the Full Disk Access grant must be re-toggled afterward.
+if [ ! -x "$HELPER_BIN" ] || [ "$HELPER_SRC" -nt "$HELPER_BIN" ]; then
+  rebuilt=0; [ -x "$HELPER_BIN" ] && rebuilt=1
+  say "Compiling vault-backup-helper…"
+  clang -O2 -Wall -Wextra -o "$HELPER_BIN" "$HELPER_SRC"
+  codesign -s - --force "$HELPER_BIN"
+  if [ "$rebuilt" -eq 1 ]; then
+    echo
+    echo "  ****************************************************************"
+    echo "  * helper rebuilt -> its Full Disk Access grant is now STALE.  *"
+    echo "  * Re-toggle FDA for ~/.local/bin/vault-backup-helper (step 6). *"
+    echo "  ****************************************************************"
+    echo
+  fi
+  say "helper built + ad-hoc signed."
+else
+  say "helper up to date — skipping compile."
+fi
+
+# 3. Git dir — clone the backup history on a fresh machine; reuse it otherwise.
+if [ -d "$GDIR" ]; then
+  say "git dir already present — reusing $GDIR."
+else
+  say "Cloning backup history into $GDIR…"
+  git clone --bare "$REPO_URL" "$GDIR"
+  # A bare clone omits the standard fetch refspec; add it so origin/$BRANCH tracks.
+  git --git-dir="$GDIR" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+  git --git-dir="$GDIR" fetch origin
+  # Prime the index from HEAD (index-only; never touches the worktree/vault).
+  git --git-dir="$GDIR" --work-tree="$VAULT" read-tree HEAD
+  say "history cloned; index primed against the vault."
+fi
+
+# 4. Config — the detached-worktree layout + tap-free auth. All idempotent.
+g() { git --git-dir="$GDIR" config "$@"; }
+g core.bare false
+g core.worktree "$VAULT"
+g core.logallrefupdates true
+g core.ignorecase true
+g core.precomposeunicode true
+g commit.gpgsign false
+g user.name "Chris Tristan"
+g user.email "1764856+CTristan@users.noreply.github.com"
+# Reset the inherited helper list (drops osxkeychain so an unattended push can't
+# hang on a UI prompt), then use gh's keyring token. --unset-all + --add (not a
+# bare set) so this is idempotent when the key is already multi-valued.
+g --unset-all credential.helper 2>/dev/null || true
+g --add credential.helper ''
+g --add credential.helper '!/opt/homebrew/bin/gh auth git-credential'
+g gc.autoDetach false
+git --git-dir="$GDIR" remote get-url origin >/dev/null 2>&1 \
+  || git --git-dir="$GDIR" remote add origin "$REPO_URL"
+say "git config applied."
+
+# 5. info/exclude — marker-guarded so re-runs don't duplicate.
+MARKER="# --- vault-backup excludes ---"
+if ! grep -qF "$MARKER" "$GDIR/info/exclude" 2>/dev/null; then
+  cat >> "$GDIR/info/exclude" <<EOF
+$MARKER
+# Per-device Obsidian UI state — churns per device, noise in history.
+**/.obsidian/workspace.json
+**/.obsidian/workspace-mobile.json
+.DS_Store
+# iCloud eviction placeholders — zero-byte stand-ins, never content.
+*.icloud
+# Deleted notes are recoverable from git history itself.
+.trash/
+EOF
+  say "info/exclude written."
+else
+  say "info/exclude already configured."
+fi
+
+# 6. (Re)load the LaunchAgent — idempotent.
+launchctl bootout "$GUI/$LABEL" 2>/dev/null || true
+launchctl bootstrap "$GUI" "$PLIST"
+say "loaded $LABEL"
+
+# 7. Finish — the one manual step (TCC can't be scripted).
+echo
+say "Setup complete. One manual step remains:"
+say "  1. System Settings > Privacy & Security > Full Disk Access"
+say "  2. Click +, press Cmd+Shift+G, enter:  $HELPER_BIN   (add + enable it)"
+say "     If /bin/zsh was granted FDA on this machine before, REMOVE that entry."
+say "  3. launchctl kickstart -k $GUI/$LABEL"
+say "Then check ~/Library/Logs/vault-backup.log for 'no changes' / 'remote up to date'."

@@ -68,7 +68,7 @@ errf="$(mktemp -t vault-backup.XXXXXX)"
 files="$(find "$VAULT" -type f -name '*.md' 2>"$errf")" && find_rc=0 || find_rc=$?
 if [ "$find_rc" -ne 0 ] || grep -qiE 'not permitted|permission denied' "$errf"; then
   msg="$(head -1 "$errf" 2>/dev/null)"; rm -f "$errf"
-  fatal "cannot read vault ($VAULT): ${msg:-find exited $find_rc}. If this says 'Operation not permitted', grant Full Disk Access to /bin/zsh in System Settings > Privacy & Security > Full Disk Access, then run: launchctl kickstart -k gui/\$(id -u)/com.user.vault-backup"
+  fatal "cannot read vault ($VAULT): ${msg:-find exited $find_rc}. If this says 'Operation not permitted', grant Full Disk Access to ~/.local/bin/vault-backup-helper in System Settings > Privacy & Security > Full Disk Access, then run: launchctl kickstart -k gui/\$(id -u)/com.user.vault-backup"
 fi
 rm -f "$errf"
 
