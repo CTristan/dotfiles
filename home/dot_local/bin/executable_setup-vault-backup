@@ -4,9 +4,10 @@
 # Run after `chezmoi apply`. Safe to re-run: each step is a no-op if already satisfied.
 #
 # What it sets up: a detached git dir (worktree -> the iCloud vault) that the
-# hourly com.user.vault-backup LaunchAgent snapshots into the private
-# personal-vault repo. Auth is the gh keyring token over HTTPS; the FDA-bearing
-# helper is compiled here (see vault-backup-helper.c for why a compiled shim).
+# com.user.vault-backup LaunchAgent (every 5 min) bidirectionally syncs against
+# the private personal-vault repo — snapshotting local edits up and integrating
+# collaborators' commits down. Auth is the gh keyring token over HTTPS; the
+# FDA-bearing helper is compiled here (see vault-backup-helper.c for why a shim).
 set -euo pipefail
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin
 
