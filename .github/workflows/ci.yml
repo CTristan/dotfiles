@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  vault-sync-tests:
+    name: CI
+    # macOS runner on purpose: these dotfiles target macOS, and the test suite
+    # uses BSD tool semantics (mktemp -d -t with a bare template) that GNU
+    # userland rejects. The repo is public, so macOS minutes are free.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Run vault-sync test suite
+        # SYNC_SCRIPT points at the un-applied chezmoi source copy, because CI
+        # has no deployed ~/.local/bin to test against.
+        run: |
+          SYNC_SCRIPT="$GITHUB_WORKSPACE/home/dot_local/bin/executable_backup-vault.sh" \
+            zsh home/dot_local/share/vault-backup/executable_test-vault-sync.zsh
