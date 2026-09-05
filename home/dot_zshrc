@@ -84,3 +84,29 @@ autoload -Uz compinit && compinit -C
 export PATH="$PATH:/Users/chris/.lmstudio/bin"
 # End of LM Studio CLI section
 
+
+# --- Claude subscription token ---
+# Reads the long-lived `claude setup-token` credential from the login keychain on
+# demand (service `agent-bench`, account `claude-token`). Deliberately a function
+# rather than an exported variable: an export would place a live subscription
+# credential in the environment of every process, including agent sessions that
+# execute generated code.
+claude-token() {
+  security find-generic-password -s agent-bench -a claude-token -w 2>/dev/null
+}
+
+# Runs a command with the subscription token in its environment and nowhere else:
+#   with-claude-token harbor run ...
+# ANTHROPIC_API_KEY is cleared for the child because it outranks the bearer token
+# in credential resolution, so leaving it set would silently bill API credits
+# instead of the subscription.
+with-claude-token() {
+  local token
+  token="$(claude-token)"
+  if [[ -z "$token" ]]; then
+    print -u2 "with-claude-token: no token in keychain (service agent-bench, account claude-token)"
+    print -u2 "  run \`claude setup-token\`, then: security add-generic-password -s agent-bench -a claude-token -w"
+    return 1
+  fi
+  ANTHROPIC_API_KEY= ANTHROPIC_AUTH_TOKEN="$token" "$@"
+}
