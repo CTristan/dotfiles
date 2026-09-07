@@ -97,9 +97,12 @@ claude-token() {
 
 # Runs a command with the subscription token in its environment and nowhere else:
 #   with-claude-token harbor run ...
+# The token travels as CLAUDE_CODE_OAUTH_TOKEN. Harbor normalises
+# ANTHROPIC_AUTH_TOKEN onto ANTHROPIC_API_KEY on the way into a container, so a
+# token under that name bills API credits instead of the subscription; agent-bench
+# refuses both names for that reason, in preflight and again before a batch.
 # ANTHROPIC_API_KEY is cleared for the child because it outranks the bearer token
-# in credential resolution, so leaving it set would silently bill API credits
-# instead of the subscription.
+# in credential resolution.
 with-claude-token() {
   local token
   token="$(claude-token)"
@@ -108,5 +111,5 @@ with-claude-token() {
     print -u2 "  run \`claude setup-token\`, then: security add-generic-password -s agent-bench -a claude-token -w"
     return 1
   fi
-  ANTHROPIC_API_KEY= ANTHROPIC_AUTH_TOKEN="$token" "$@"
+  ANTHROPIC_API_KEY= ANTHROPIC_AUTH_TOKEN= CLAUDE_CODE_OAUTH_TOKEN="$token" "$@"
 }
