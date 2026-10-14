@@ -1,0 +1,130 @@
+#!/bin/bash
+# Setup rechecks the machine so an interrupted run can resume without a reset.
+set -uo pipefail
+umask 077
+export PATH="${DOTFILES_TOOLS_PATH:+$DOTFILES_TOOLS_PATH:}/opt/homebrew/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1
+
+CHECK=0
+NO_BITWARDEN=0
+DOTFILES_SKIP=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --check) CHECK=1 ;;
+    --no-bitwarden) NO_BITWARDEN=1 ;;
+    --skip)
+      [ "$#" -ge 2 ] || { echo "--skip needs a comma-separated component list" >&2; exit 1; }
+      DOTFILES_SKIP="$2"; shift ;;
+    --skip=*) DOTFILES_SKIP="${1#*=}" ;;
+    --help|-h)
+      echo "Usage: bootstrap [--check] [--no-bitwarden] [--skip asf,vault,runtimes]"
+      echo "Exit: 0 complete, 2 pending user action, 1 failed."
+      exit 0 ;;
+    *) echo "Unknown option: $1" >&2; exit 1 ;;
+  esac
+  shift
+done
+case ",$DOTFILES_SKIP," in *,,*) [ -z "$DOTFILES_SKIP" ] || { echo "Empty --skip component" >&2; exit 1; } ;; esac
+if [ -n "$DOTFILES_SKIP" ]; then
+  IFS=, read -r -a skipped_components <<< "$DOTFILES_SKIP"
+  for component in "${skipped_components[@]}"; do
+    case "$component" in asf|vault|runtimes) ;; *) echo "Unknown component: $component" >&2; exit 1 ;; esac
+  done
+fi
+export DOTFILES_SKIP
+checkout_stage=""
+installer=""
+cleanup_bootstrap() {
+  [ -z "$installer" ] || rm -f "$installer"
+  [ -z "$checkout_stage" ] || rm -rf "$checkout_stage"
+}
+trap cleanup_bootstrap EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+pending=0
+failed=0
+report() {
+  printf '%-20s %-9s %s\n' "$1" "$2" "${3:-}"
+  case "$2" in pending) pending=1 ;; failed) failed=1 ;; esac
+}
+finish() {
+  [ "$failed" -eq 0 ] || return 1
+  [ "$pending" -eq 0 ] || return 2
+  return 0
+}
+interactive() { [ -t 0 ] && [ -t 1 ]; }
+skip_component() { case ",$DOTFILES_SKIP," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
+
+if [ "$(uname -s)" != Darwin ] || [ "$(uname -m)" != arm64 ]; then
+  report Platform failed "This setup targets Apple-silicon macOS."
+  exit 1
+fi
+report Platform complete
+
+clt_ready=0
+if xcode-select -p >/dev/null 2>&1 && xcrun --find clang >/dev/null 2>&1; then
+  clt_ready=1
+  report "Command Line Tools" complete
+else
+  if [ "$CHECK" -eq 0 ] && interactive; then
+    xcode-select --install >/dev/null 2>&1 || true
+  fi
+  report "Command Line Tools" pending "Finish Apple's installer, then rerun bootstrap."
+fi
+
+brew_ready=0
+if command -v brew >/dev/null 2>&1; then
+  brew_ready=1
+  report Homebrew complete
+elif [ "$CHECK" -eq 0 ] && [ "$clt_ready" -eq 1 ] && interactive; then
+  installer="$(mktemp -t dotfiles-homebrew)" || exit 1
+  if curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh -o "$installer" && /bin/bash "$installer"; then
+    export PATH="/opt/homebrew/bin:$PATH"
+    command -v brew >/dev/null 2>&1 && brew_ready=1
+  fi
+  rm -f "$installer"
+  if [ "$brew_ready" -eq 1 ]; then report Homebrew complete; else report Homebrew failed "Installation did not complete; rerun bootstrap."; fi
+else
+  report Homebrew pending "Install Command Line Tools and rerun bootstrap in a terminal."
+fi
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$script_dir/.chezmoiroot" ] && [ -d "$script_dir/home" ]; then
+  REPO_DIR="$script_dir"
+else
+  REPO_DIR="$HOME/.local/share/chezmoi"
+  if command -v chezmoi >/dev/null 2>&1; then
+    configured_source="$(chezmoi source-path 2>/dev/null)" || configured_source=""
+    if [ -n "$configured_source" ] && [ -f "$configured_source/../.chezmoiroot" ]; then
+      REPO_DIR="$(cd "$configured_source/.." && pwd)"
+    fi
+  fi
+  if [ ! -e "$REPO_DIR" ] && [ "$CHECK" -eq 0 ] && [ "$clt_ready" -eq 1 ]; then
+    mkdir -p "$(dirname "$REPO_DIR")" || exit 1
+    checkout_stage="$(mktemp -d "$(dirname "$REPO_DIR")/.dotfiles-checkout.XXXXXX")" || exit 1
+    git clone https://github.com/CTristan/dotfiles.git "$checkout_stage/repository" || { report Checkout failed "Clone failed; existing work was preserved."; finish; exit $?; }
+    [ ! -e "$REPO_DIR" ] || { report Checkout failed "The destination appeared during cloning; existing work was preserved."; exit 1; }
+    mv "$checkout_stage/repository" "$REPO_DIR" || exit 1
+    rm -rf "$checkout_stage"
+    checkout_stage=""
+  fi
+fi
+
+if [ ! -f "$REPO_DIR/.chezmoiroot" ] || [ ! -f "$REPO_DIR/scripts/bootstrap-lib.sh" ]; then
+  report Checkout pending "A checkout containing this bootstrap is needed at $REPO_DIR."
+  finish
+  exit $?
+fi
+if [ "$clt_ready" -eq 1 ]; then
+  remote="$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null)" || remote=""
+  case "$remote" in
+    https://github.com/CTristan/dotfiles|https://github.com/CTristan/dotfiles.git|git@github.com:CTristan/dotfiles.git) ;;
+    *) report Checkout failed "Refusing to use a checkout with an unrelated origin: $REPO_DIR"; exit 1 ;;
+  esac
+fi
+report Checkout complete "$REPO_DIR (existing changes preserved)"
+
+source "$REPO_DIR/scripts/bootstrap-lib.sh"
+bootstrap_components
+finish

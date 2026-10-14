@@ -18,10 +18,9 @@
  * recompile changes the code identity and macOS silently drops the FDA grant.
  * Re-toggle it in System Settings whenever setup-vault-backup rebuilds this.
  *
- * NO ARGV/ENV TARGET: the script path is derived from $HOME only — the grant
- * can't be redirected to arbitrary code via arguments. (The script itself lives
- * at a user-writable path, so the narrowing is any-zsh -> this-one-path, not
- * absolute; that residual is the reason the script fails loud, not silent.)
+ * NO ARGV/ENV TARGET: the script path is derived from $HOME only. The sole
+ * accepted option is --check, which asks that same script for read-only vault
+ * readiness; arbitrary script paths and sync options are rejected.
  */
 #include <spawn.h>
 #include <stdio.h>
@@ -31,7 +30,15 @@
 
 extern char **environ;
 
-int main(void) {
+int main(int argc, char **argv) {
+    int check_only = 0;
+    if (argc == 2 && strcmp(argv[1], "--check") == 0) {
+        check_only = 1;
+    } else if (argc != 1) {
+        fprintf(stderr, "usage: vault-backup-helper [--check]\n");
+        return 1;
+    }
+
     const char *home = getenv("HOME");
     if (home == NULL || home[0] == '\0') {
         fprintf(stderr, "vault-backup-helper: HOME is unset\n");
@@ -45,9 +52,11 @@ int main(void) {
         return 1;
     }
 
-    char *const argv[] = {"/bin/zsh", script, NULL};
+    char *const child_argv_check[] = {"/bin/zsh", script, "--check", NULL};
+    char *const child_argv_sync[] = {"/bin/zsh", script, NULL};
+    char *const *child_argv = check_only ? child_argv_check : child_argv_sync;
     pid_t pid;
-    int rc = posix_spawn(&pid, "/bin/zsh", NULL, NULL, argv, environ);
+    int rc = posix_spawn(&pid, "/bin/zsh", NULL, NULL, (char *const *)child_argv, environ);
     if (rc != 0) {
         fprintf(stderr, "vault-backup-helper: posix_spawn failed: %s\n", strerror(rc));
         return 1;

@@ -23,3 +23,5 @@ key.txt
 # chezmoi local config / state (may carry secrets or machine-specific paths)
 chezmoi.toml
 chezmoistate.boltdb
+__pycache__/
+*.pyc

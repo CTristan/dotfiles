@@ -1,124 +1,391 @@
 #!/bin/zsh
-# One-shot, idempotent installer for the Obsidian vault git backup on a new/separate Mac.
-# Managed by chezmoi (CTristan/dotfiles) — contains NO secrets.
-# Run after `chezmoi apply`. Safe to re-run: each step is a no-op if already satisfied.
-#
-# What it sets up: a detached git dir (worktree -> the iCloud vault) that the
-# com.user.vault-backup LaunchAgent (every 5 min) bidirectionally syncs against
-# the private personal-vault repo — snapshotting local edits up and integrating
-# collaborators' commits down. Auth is the gh keyring token over HTTPS; the
-# FDA-bearing helper is compiled here (see vault-backup-helper.c for why a shim).
+# Prepare the detached Obsidian vault history and enable its LaunchAgent only
+# after the FDA-bearing helper proves the vault is readable and hydrated.
 set -euo pipefail
-export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin
+
+PATH_BASE="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+if [[ -n "${VAULT_SETUP_TOOLS_PATH:-}" ]]; then
+  export PATH="$VAULT_SETUP_TOOLS_PATH:$PATH_BASE"
+else
+  export PATH="$PATH_BASE"
+fi
 
 VAULT="${VAULT_BACKUP_WORKTREE:-$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Personal}"
 GDIR="${VAULT_BACKUP_GIT_DIR:-$HOME/.local/state/vault-backup.git}"
-REPO_URL="https://github.com/CTristan/personal-vault.git"
-BRANCH=main
+REPO_URL="${VAULT_BACKUP_REPO_URL:-https://github.com/CTristan/personal-vault.git}"
+BRANCH="${VAULT_BACKUP_BRANCH:-main}"
 LABEL=com.user.vault-backup
-PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 GUI="gui/$(id -u)"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 HELPER_SRC="$HOME/.local/share/vault-backup/vault-backup-helper.c"
 HELPER_BIN="$HOME/.local/bin/vault-backup-helper"
+HELPER_HASH="$HELPER_BIN.source-sha256"
+SYNC_SCRIPT="$HOME/.local/bin/backup-vault.sh"
+STAGE_ROOT=""
+TEMP_BIN=""
+TEMP_HASH=""
 
-say()  { echo "==> $*"; }
-warn() { echo "==> WARN: $*" >&2; }
+say()     { print -r -- "==> $*"; }
+warn()    { print -ru2 -- "==> $*"; }
+pending() { warn "pending: $*"; return 0; }
+failed()  { warn "failed: $*"; return 0; }
+cleanup() {
+  [[ -n "$STAGE_ROOT" && -d "$STAGE_ROOT" ]] && rm -rf "$STAGE_ROOT"
+  [[ -n "$TEMP_BIN" && -e "$TEMP_BIN" ]] && rm -f "$TEMP_BIN"
+  [[ -n "$TEMP_HASH" && -e "$TEMP_HASH" ]] && rm -f "$TEMP_HASH"
+}
+trap cleanup EXIT INT TERM
 
-mkdir -p "$HOME/.local/bin" "$HOME/.local/state" "$HOME/Library/Logs" "$HOME/Library/LaunchAgents"
+usage() {
+  print -u2 -- "usage: setup-vault-backup [--check]"
+  return 1
+}
 
-# 1. Preflight — every tool the unattended job depends on.
-command -v git   >/dev/null 2>&1 || { echo "git not found"; exit 1; }
-command -v clang >/dev/null 2>&1 || { echo "clang not found — install the Xcode Command Line Tools: xcode-select --install"; exit 1; }
-command -v gh    >/dev/null 2>&1 || { echo "gh not found — install: brew install gh"; exit 1; }
-gh auth status >/dev/null 2>&1   || { echo "gh not authenticated — run: gh auth login"; exit 1; }
-[ -f "$HELPER_SRC" ] || { echo "helper source missing: $HELPER_SRC — run 'chezmoi apply' first"; exit 1; }
-[ -f "$PLIST" ]      || { echo "LaunchAgent plist missing: $PLIST — run 'chezmoi apply' first"; exit 1; }
+sha256_file() {
+  local result
+  result=$(shasum -a 256 "$1") || return 1
+  print -r -- "${result%% *}"
+}
 
-# 2. Compile the FDA helper — only when missing or the source is newer.
-#    A rebuild changes the ad-hoc signature, which macOS treats as a new identity,
-#    so the Full Disk Access grant must be re-toggled afterward.
-if [ ! -x "$HELPER_BIN" ] || [ "$HELPER_SRC" -nt "$HELPER_BIN" ]; then
-  rebuilt=0; [ -x "$HELPER_BIN" ] && rebuilt=1
-  say "Compiling vault-backup-helper…"
-  clang -O2 -Wall -Wextra -o "$HELPER_BIN" "$HELPER_SRC"
-  codesign -s - --force "$HELPER_BIN"
-  if [ "$rebuilt" -eq 1 ]; then
-    echo
-    echo "  ****************************************************************"
-    echo "  * helper rebuilt -> its Full Disk Access grant is now STALE.  *"
-    echo "  * Re-toggle FDA for ~/.local/bin/vault-backup-helper (step 6). *"
-    echo "  ****************************************************************"
-    echo
+helper_needs_build() {
+  local source_hash binary_hash saved_source saved_binary
+
+  [[ -x "$HELPER_BIN" && -f "$HELPER_HASH" ]] || return 0
+  source_hash=$(sha256_file "$HELPER_SRC") || return 0
+  binary_hash=$(sha256_file "$HELPER_BIN") || return 0
+  read -r saved_source saved_binary < "$HELPER_HASH" || return 0
+  codesign --verify --strict "$HELPER_BIN" >/dev/null 2>&1 || return 0
+  [[ "$source_hash" != "$saved_source" || "$binary_hash" != "$saved_binary" ]]
+}
+
+helper_is_current() {
+  local source_hash binary_hash saved_source saved_binary
+
+  [[ -x "$HELPER_BIN" && -f "$HELPER_HASH" ]] || return 1
+  source_hash=$(sha256_file "$HELPER_SRC") || return 1
+  binary_hash=$(sha256_file "$HELPER_BIN") || return 1
+  read -r saved_source saved_binary < "$HELPER_HASH" || return 1
+  [[ "$source_hash" == "$saved_source" && "$binary_hash" == "$saved_binary" ]]
+}
+
+service_loaded() {
+  launchctl print "$GUI/$LABEL" >/dev/null 2>&1
+}
+
+check_status() {
+  local pending_count=0 failure_count=0 helper_output helper_rc required_path
+
+  if [[ "$(uname -s)" != Darwin || "$(uname -m)" != arm64 ]]; then
+    warn "failed: vault backup setup targets Apple-silicon macOS"
+    return 1
   fi
-  say "helper built + ad-hoc signed."
-else
-  say "helper up to date — skipping compile."
-fi
 
-# 3. Git dir — clone the backup history on a fresh machine; reuse it otherwise.
-if [ -d "$GDIR" ]; then
-  say "git dir already present — reusing $GDIR."
-else
-  say "Cloning backup history into $GDIR…"
-  git clone --bare "$REPO_URL" "$GDIR"
-  # A bare clone omits the standard fetch refspec; add it so origin/$BRANCH tracks.
-  git --git-dir="$GDIR" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
-  git --git-dir="$GDIR" fetch origin
-  # Prime the index from HEAD (index-only; never touches the worktree/vault).
-  git --git-dir="$GDIR" --work-tree="$VAULT" read-tree HEAD
-  say "history cloned; index primed against the vault."
-fi
+  for required_path in "$HELPER_SRC" "$SYNC_SCRIPT" "$PLIST"; do
+    if [[ ! -f "$required_path" ]]; then
+      warn "pending: $required_path is missing; apply the dotfiles checkout and rerun setup-vault-backup"
+      pending_count=$((pending_count + 1))
+    fi
+  done
 
-# 4. Config — the detached-worktree layout + tap-free auth. All idempotent.
-g() { git --git-dir="$GDIR" config "$@"; }
-g core.bare false
-g core.worktree "$VAULT"
-g core.logallrefupdates true
-g core.ignorecase true
-g core.precomposeunicode true
-g commit.gpgsign false
-g user.name "Chris Tristan"
-g user.email "1764856+CTristan@users.noreply.github.com"
-# Reset the inherited helper list (drops osxkeychain so an unattended push can't
-# hang on a UI prompt), then use gh's keyring token. --unset-all + --add (not a
-# bare set) so this is idempotent when the key is already multi-valued.
-g --unset-all credential.helper 2>/dev/null || true
-g --add credential.helper ''
-g --add credential.helper '!/opt/homebrew/bin/gh auth git-credential'
-g gc.autoDetach false
-git --git-dir="$GDIR" remote get-url origin >/dev/null 2>&1 \
-  || git --git-dir="$GDIR" remote add origin "$REPO_URL"
-say "git config applied."
+  if ! command -v git >/dev/null 2>&1; then
+    warn "pending: Git is missing; install the Command Line Tools, then rerun setup-vault-backup"
+    pending_count=$((pending_count + 1))
+  fi
+  if ! command -v gh >/dev/null 2>&1; then
+    warn "pending: GitHub CLI is missing; install it, then rerun setup-vault-backup"
+    pending_count=$((pending_count + 1))
+  elif ! gh auth status >/dev/null 2>&1; then
+    warn "pending: authenticate GitHub CLI with access to the private vault repository, then rerun setup-vault-backup"
+    pending_count=$((pending_count + 1))
+  fi
 
-# 5. info/exclude — marker-guarded so re-runs don't duplicate.
-MARKER="# --- vault-backup excludes ---"
-if ! grep -qF "$MARKER" "$GDIR/info/exclude" 2>/dev/null; then
-  cat >> "$GDIR/info/exclude" <<EOF
-$MARKER
-# Per-device Obsidian UI state — churns per device, noise in history.
+  if [[ ! -x "$HELPER_BIN" ]]; then
+    warn "pending: the signed vault-backup helper has not been built; rerun setup-vault-backup"
+    pending_count=$((pending_count + 1))
+  elif [[ ! -f "$HELPER_SRC" ]] || ! helper_is_current; then
+    warn "pending: the helper source or binary changed; rerun setup-vault-backup to rebuild and recheck Full Disk Access"
+    pending_count=$((pending_count + 1))
+  elif ! codesign --verify --strict "$HELPER_BIN" >/dev/null 2>&1; then
+    warn "pending: the helper signature is invalid; rerun setup-vault-backup to rebuild and recheck Full Disk Access"
+    pending_count=$((pending_count + 1))
+  else
+    helper_output=""
+    helper_rc=0
+    helper_output=$("$HELPER_BIN" --check 2>&1) || helper_rc=$?
+    print -r -- "$helper_output"
+    if (( helper_rc == 2 )); then
+      pending_count=$((pending_count + 1))
+    elif (( helper_rc != 0 )); then
+      warn "failed: vault preflight returned $helper_rc"
+      failure_count=$((failure_count + 1))
+    elif [[ "$helper_output" != *"preflight ready:"* ]]; then
+      warn "failed: helper returned success without the preflight-ready marker"
+      failure_count=$((failure_count + 1))
+    fi
+  fi
+
+  if ! command -v launchctl >/dev/null 2>&1; then
+    warn "pending: launchctl is unavailable on this system"
+    pending_count=$((pending_count + 1))
+  elif ! service_loaded; then
+    warn "pending: $LABEL is not loaded; setup-vault-backup must complete a verified sync before loading it"
+    pending_count=$((pending_count + 1))
+  fi
+
+  if (( failure_count > 0 )); then
+    return 1
+  elif (( pending_count > 0 )); then
+    return 2
+  fi
+  say "locally ready: vault is readable and hydrated; $LABEL is loaded"
+  return 0
+}
+
+set_config_if_needed() {
+  local git_dir="$1" key="$2" value="$3" current
+  current=$(git --git-dir="$git_dir" config --get "$key" 2>/dev/null || true)
+  [[ "$current" == "$value" ]] || git --git-dir="$git_dir" config "$key" "$value"
+}
+
+configure_git_dir() {
+  local git_dir="$1" gh_bin="$2" current expected marker
+
+  git --git-dir="$git_dir" rev-parse --verify HEAD >/dev/null 2>&1 \
+    || { warn "detached Git history has no valid HEAD: $git_dir"; return 1; }
+  git --git-dir="$git_dir" remote get-url origin >/dev/null 2>&1 \
+    || { warn "detached Git history has no origin remote: $git_dir"; return 1; }
+
+  set_config_if_needed "$git_dir" core.bare false || return 1
+  set_config_if_needed "$git_dir" core.worktree "$VAULT" || return 1
+  set_config_if_needed "$git_dir" core.logallrefupdates true || return 1
+  set_config_if_needed "$git_dir" core.ignorecase true || return 1
+  set_config_if_needed "$git_dir" core.precomposeunicode true || return 1
+  set_config_if_needed "$git_dir" commit.gpgsign false || return 1
+  set_config_if_needed "$git_dir" user.name "Chris Tristan" || return 1
+  set_config_if_needed "$git_dir" user.email "1764856+CTristan@users.noreply.github.com" || return 1
+  set_config_if_needed "$git_dir" gc.autoDetach false || return 1
+
+  current=$(git --git-dir="$git_dir" config --get-all credential.helper 2>/dev/null || true)
+  expected=$'\n!'"$gh_bin"' auth git-credential'
+  if [[ "$current" != "$expected" ]]; then
+    git --git-dir="$git_dir" config --unset-all credential.helper 2>/dev/null || true
+    git --git-dir="$git_dir" config --add credential.helper '' || return 1
+    git --git-dir="$git_dir" config --add credential.helper "!$gh_bin auth git-credential" || return 1
+  fi
+
+  current=$(git --git-dir="$git_dir" config --get-all remote.origin.fetch 2>/dev/null || true)
+  if [[ "$current" != "+refs/heads/*:refs/remotes/origin/*" ]]; then
+    git --git-dir="$git_dir" config --unset-all remote.origin.fetch 2>/dev/null || true
+    git --git-dir="$git_dir" config --add remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*' || return 1
+  fi
+
+  marker="# --- vault-backup excludes ---"
+  if ! grep -qF "$marker" "$git_dir/info/exclude" 2>/dev/null; then
+    cat >> "$git_dir/info/exclude" <<'EOF' || return 1
+# --- vault-backup excludes ---
+# Per-device Obsidian UI state churns per device and adds noise to history.
 **/.obsidian/workspace.json
 **/.obsidian/workspace-mobile.json
 .DS_Store
-# iCloud eviction placeholders — zero-byte stand-ins, never content.
+# iCloud eviction placeholders are zero-byte stand-ins, never content.
 *.icloud
-# Deleted notes are recoverable from git history itself.
+# Deleted notes remain recoverable from Git history.
 .trash/
 EOF
-  say "info/exclude written."
-else
-  say "info/exclude already configured."
-fi
+  fi
+}
 
-# 6. (Re)load the LaunchAgent — idempotent.
-launchctl bootout "$GUI/$LABEL" 2>/dev/null || true
-launchctl bootstrap "$GUI" "$PLIST"
-say "loaded $LABEL"
+prepare_git_dir() {
+  local gh_bin="$1" parent stage_git
 
-# 7. Finish — the one manual step (TCC can't be scripted).
-echo
-say "Setup complete. One manual step remains:"
-say "  1. System Settings > Privacy & Security > Full Disk Access"
-say "  2. Click +, press Cmd+Shift+G, enter:  $HELPER_BIN   (add + enable it)"
-say "     If /bin/zsh was granted FDA on this machine before, REMOVE that entry."
-say "  3. launchctl kickstart -k $GUI/$LABEL"
-say "Then check ~/Library/Logs/vault-backup.log for 'no changes' / 'remote up to date'."
+  if [[ -e "$GDIR" ]]; then
+    [[ -d "$GDIR" ]] || { warn "detached Git history path exists but is not a directory: $GDIR"; return 1; }
+    configure_git_dir "$GDIR" "$gh_bin" || return 1
+    return 0
+  fi
+
+  parent="${GDIR:h}"
+  mkdir -p "$parent"
+  STAGE_ROOT=$(mktemp -d "$parent/.vault-backup-bootstrap.XXXXXX") || { warn "could not create a staging directory beside $GDIR"; return 1; }
+  stage_git="$STAGE_ROOT/history.git"
+  say "Cloning private vault history into a staging directory…"
+  if ! git clone --bare "$REPO_URL" "$stage_git"; then
+    warn "could not clone $REPO_URL; check GitHub browser authentication and network access"
+    return 2
+  fi
+  git --git-dir="$stage_git" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+  if ! git --git-dir="$stage_git" fetch origin; then
+    warn "could not fetch the private vault history; check the network and GitHub access, then rerun setup-vault-backup"
+    return 2
+  fi
+  git --git-dir="$stage_git" show-ref --verify --quiet "refs/remotes/origin/$BRANCH" \
+    || { warn "the private vault repository does not contain origin/$BRANCH"; return 1; }
+  git --git-dir="$stage_git" symbolic-ref HEAD "refs/heads/$BRANCH"
+  git --git-dir="$stage_git" update-ref "refs/heads/$BRANCH" "refs/remotes/origin/$BRANCH"
+  configure_git_dir "$stage_git" "$gh_bin" || return 1
+  git --git-dir="$stage_git" --work-tree="$VAULT" read-tree "refs/heads/$BRANCH"
+
+  [[ ! -e "$GDIR" ]] || { warn "detached Git history appeared during setup; refusing to replace it: $GDIR"; return 1; }
+  mv "$stage_git" "$GDIR"
+  return 0
+}
+
+build_helper_if_needed() {
+  local source_hash binary_hash was_existing
+
+  if ! helper_needs_build; then
+    say "FDA helper matches its recorded source and binary hashes."
+    return 0
+  fi
+  command -v clang >/dev/null 2>&1 || { warn "clang is missing; install the Xcode Command Line Tools, then rerun setup-vault-backup"; return 1; }
+  command -v codesign >/dev/null 2>&1 || { warn "codesign is missing; run setup-vault-backup on macOS"; return 1; }
+
+  source_hash=$(sha256_file "$HELPER_SRC") || { warn "could not hash helper source: $HELPER_SRC"; return 1; }
+  TEMP_BIN=$(mktemp "$HOME/.local/bin/.vault-backup-helper.XXXXXX") || { warn "could not create a temporary helper binary"; return 1; }
+  TEMP_HASH="$HELPER_HASH.tmp.$$"
+
+  say "Compiling and signing the FDA helper…"
+  if ! clang -O2 -Wall -Wextra -o "$TEMP_BIN" "$HELPER_SRC"; then
+    warn "could not compile vault-backup-helper"
+    return 1
+  fi
+  chmod 755 "$TEMP_BIN" || return 1
+  if ! codesign -s - --force "$TEMP_BIN"; then
+    warn "could not ad-hoc sign vault-backup-helper"
+    return 1
+  fi
+
+  was_existing=0
+  [[ -x "$HELPER_BIN" ]] && was_existing=1
+  if (( was_existing )) && service_loaded; then
+    launchctl bootout "$GUI/$LABEL" || { warn "could not stop $LABEL before replacing its FDA helper"; return 1; }
+    say "Stopped $LABEL because rebuilding the FDA helper can invalidate its Full Disk Access grant."
+  fi
+
+  mv "$TEMP_BIN" "$HELPER_BIN" || return 1
+  TEMP_BIN=""
+  binary_hash=$(sha256_file "$HELPER_BIN") || { warn "could not hash compiled helper"; return 1; }
+  print -r -- "$source_hash $binary_hash" > "$TEMP_HASH" || return 1
+  mv "$TEMP_HASH" "$HELPER_HASH" || return 1
+  TEMP_HASH=""
+  codesign --verify --strict "$HELPER_BIN" || { warn "compiled helper signature did not verify"; return 1; }
+  if (( was_existing )); then
+    say "Helper rebuilt. Confirm or re-toggle Full Disk Access for $HELPER_BIN when preflight requests it."
+  else
+    say "Helper built and signed. Grant Full Disk Access only after preflight reports it is needed."
+  fi
+  return 0
+}
+
+preflight_vault() {
+  local output rc
+  output=""
+  rc=0
+  output=$("$HELPER_BIN" --check 2>&1) || rc=$?
+  print -r -- "$output"
+  if (( rc == 0 )) && [[ "$output" == *"preflight ready:"* ]]; then
+    return 0
+  elif (( rc == 2 )); then
+    if [[ "$output" == *"Full Disk Access"* ]]; then
+      warn "pending: enable Full Disk Access for $HELPER_BIN in System Settings > Privacy & Security > Full Disk Access, then rerun setup-vault-backup"
+    else
+      warn "pending: resolve the vault readiness message above, then rerun setup-vault-backup"
+    fi
+    return 2
+  elif (( rc == 0 )); then
+    warn "failed: helper returned success without the preflight-ready marker"
+    return 1
+  fi
+  warn "failed: vault preflight returned $rc"
+  return 1
+}
+
+is_completed_sync() {
+  local output="$1"
+  [[ "$output" == *"remote up to date; done"* \
+     || "$output" == *"pushed "*" commit(s) to origin/$BRANCH; done"* \
+     || "$output" == *"pushed after retry; done"* ]] || return 1
+  [[ "$output" != *"another run holds the lock"* \
+     && "$output" != *"skipping snapshot this cycle"* \
+     && "$output" != *"deferring integration one cycle"* \
+     && "$output" != *"fetch failed (offline?)"* ]]
+}
+
+run_sync_and_enable() {
+  local output rc
+
+  output=""
+  rc=0
+  output=$("$HELPER_BIN" 2>&1) || rc=$?
+  print -r -- "$output"
+  if (( rc != 0 )); then
+    if (( rc == 2 )); then
+      warn "pending: the sync cycle needs attention; resolve its message above and rerun setup-vault-backup"
+      return 2
+    fi
+    warn "failed: the sync cycle returned $rc; $LABEL remains unloaded"
+    return 1
+  fi
+  if ! is_completed_sync "$output"; then
+    warn "pending: the sync process did not report a completed cycle; $LABEL remains unloaded"
+    return 2
+  fi
+  say "A complete vault sync cycle succeeded."
+
+  if ! service_loaded; then
+    launchctl bootstrap "$GUI" "$PLIST" || { warn "could not load $LABEL"; return 1; }
+  else
+    say "$LABEL is already loaded."
+  fi
+  service_loaded || { warn "$LABEL did not appear loaded after setup"; return 1; }
+  say "Setup complete. The LaunchAgent will check the vault every five minutes."
+  return 0
+}
+
+main() {
+  local gh_bin rc
+
+  if (( $# == 1 )) && [[ "$1" == --check ]]; then
+    check_status || return $?
+    return 0
+  elif (( $# != 0 )); then
+    usage
+    return 1
+  fi
+
+  if [[ "$(uname -s)" != Darwin || "$(uname -m)" != arm64 ]]; then
+    failed "vault backup setup targets Apple-silicon macOS"
+    return 1
+  fi
+  local required_path
+  for required_path in "$HELPER_SRC" "$SYNC_SCRIPT" "$PLIST"; do
+    [[ -f "$required_path" ]] || { pending "$required_path is missing; apply the dotfiles checkout and rerun setup-vault-backup"; return 2; }
+  done
+  for tool in git gh; do
+    command -v "$tool" >/dev/null 2>&1 || { pending "$tool is missing; install the documented tools, then rerun setup-vault-backup"; return 2; }
+  done
+  gh_bin=$(command -v gh)
+  if ! gh auth status >/dev/null 2>&1; then
+    pending "authenticate GitHub CLI with access to the private vault repository; run: gh auth login -h github.com -s repo"
+    return 2
+  fi
+
+  mkdir -p "$HOME/.local/bin" "$HOME/.local/state" "$HOME/Library/Logs" "$HOME/Library/LaunchAgents"
+  build_helper_if_needed || return $?
+
+  rc=0
+  prepare_git_dir "$gh_bin" || rc=$?
+  if (( rc == 2 )); then
+    pending "private vault history is unavailable; resolve the GitHub or network message above, then rerun setup-vault-backup"
+    return 2
+  elif (( rc != 0 )); then
+    failed "could not prepare detached Git history; see the message above"
+    return 1
+  fi
+
+  preflight_vault || return $?
+  run_sync_and_enable || return $?
+  return 0
+}
+
+main "$@"

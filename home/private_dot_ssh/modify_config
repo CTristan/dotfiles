@@ -1,0 +1,11 @@
+{{- /* chezmoi:modify-template */ -}}
+{{- $start := "# >>> chezmoi managed Secretive SSH agent >>>" -}}
+{{- $end := "# <<< chezmoi managed Secretive SSH agent <<<" -}}
+{{- $managedBlock := "(?ms)^# >>> chezmoi managed Secretive SSH agent >>>\\r?\\n.*?^# <<< chezmoi managed Secretive SSH agent <<<\\r?\\n?" -}}
+{{- $config := replaceAllRegex $managedBlock "" .chezmoi.stdin -}}
+{{- $config = replaceAllRegex "[\\r\\n]+$" "" $config -}}
+{{- if $config -}}
+{{ printf "%s\n\n%s\nHost *\n    IdentityAgent ~/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh\n%s\n" $config $start $end -}}
+{{- else -}}
+{{ printf "%s\nHost *\n    IdentityAgent ~/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh\n%s\n" $start $end -}}
+{{- end -}}

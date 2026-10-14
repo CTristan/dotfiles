@@ -14,9 +14,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Run vault-sync test suite
-        # SYNC_SCRIPT points at the un-applied chezmoi source copy, because CI
-        # has no deployed ~/.local/bin to test against.
+      - name: Install template test dependency
+        run: brew install chezmoi
+      - name: Run setup and recovery tests
         run: |
-          SYNC_SCRIPT="$GITHUB_WORKSPACE/home/dot_local/bin/executable_backup-vault.sh" \
-            zsh home/dot_local/share/vault-backup/executable_test-vault-sync.zsh
+          bash tests/run.sh

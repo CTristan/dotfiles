@@ -1,191 +1,60 @@
 # dotfiles
 
-Personal macOS dotfiles managed with [chezmoi](https://www.chezmoi.io/). Source of truth for `.zshrc`, `.gitconfig`, and the Brave Search env template (Bitwarden-backed).
+Personal macOS dotfiles managed with [chezmoi](https://www.chezmoi.io/). The repository manages the shell and Git configuration, ASF setup and encrypted backups, and Obsidian vault backups. The guided bootstrap installs and configures the selected components on Apple-silicon Macs.
 
-> Claude Code config — `~/.claude/` (including `CLAUDE.md`, skills, and scripts) — lives in the **separate private** repo [`CTristan/dotclaude`](https://github.com/CTristan/dotclaude), **not here**. This public repo only manages portable machine dotfiles.
+## Set up a new Mac
 
-## What's inside
-
-| Path (rendered)                                  | Purpose                                                         |
-| ------------------------------------------------ | --------------------------------------------------------------- |
-| `~/.zshrc`                                       | Oh My Zsh + Dracula, PATH, Secretive SSH agent, pnpm/bun shims, `claude` wrapper |
-| `~/.gitconfig`                                   | git LFS, SSH commit signing, include for `~/.config/git/config.local` |
-| `~/.chezmoi.toml`                                | chezmoi config — editor = `code`, Bitwarden unlock = auto        |
-| `~/.config/brave-search/env.sh`                  | Brave API key from Bitwarden (template, fault-tolerant, mode 0600) |
-| `~/.local/bin/setup-asf`                         | Install or restore ArchiSteamFarm and load its LaunchAgents      |
-| `~/.local/bin/backup-asf-config.sh`               | Encrypted, rotating ASF config backups in iCloud Drive            |
-| `~/Library/LaunchAgents/com.user.archisteamfarm.plist` | Start and supervise ASF in your user session                |
-| `~/Library/LaunchAgents/com.user.asf-backup.plist` | Back up ASF config at login and daily at 03:00 local time         |
-
-## Restoring to a new Mac
-
-Work through these in order. Anything missing a prerequisite will surface as a `chezmoi apply` error; fix and re-run.
-
-### 1. Install Homebrew
+Run this command in Terminal on the new Mac:
 
 ```sh
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+bootstrap_file="$(mktemp)"
+trap 'rm -f "$bootstrap_file"' EXIT
+curl -fsSL 'https://raw.githubusercontent.com/CTristan/dotfiles/main/bootstrap' -o "$bootstrap_file"
+/bin/bash "$bootstrap_file"
 ```
 
-Then follow the on-screen instructions to add `brew` to your PATH (needed for the rest of the steps).
+The bootstrap installs missing Command Line Tools and Homebrew, then clones the checkout to `~/.local/share/chezmoi` or reuses the existing chezmoi checkout for this repository. It runs the selected setup stages in order and pauses for account sign-in, key selection, permissions, or other steps that need you. After resolving a pending step, rerun the bootstrap to continue.
 
-### 2. Install the tools chezmoi depends on
+From the checkout path reported by setup, run `./bootstrap` to resume. The bootstrap applies dotfiles from that checkout, respects `.chezmoiroot`, and uses chezmoi’s conflict handling. It installs Oh My Zsh and Dracula without allowing their installers to replace an existing `~/.zshrc`; the chezmoi editor preference remains `code`.
+
+All components are selected by default. Use these options to inspect or customize a run:
 
 ```sh
-brew install chezmoi bitwarden-cli jq
-brew install --cask secretive
+./bootstrap --check
+./bootstrap --no-bitwarden
+./bootstrap --skip asf,vault,runtimes
 ```
 
-- `chezmoi` applies the dotfiles.
-- `bitwarden-cli` (`bw`) + `jq` render the Brave Search env template.
-- `Secretive` provides the SSH agent socket used for both git commit signing and auth (see `dot_zshrc`).
+`--check` only reports observed status; it does not install software, authenticate, prompt for signing, change services, or write files. Each component is reported as complete, pending user action, skipped, or failed. The command exits with `0` when all selected components are complete, `2` when a user action is pending, and `1` when a step fails.
 
-### 3. Set up Bitwarden (for the Brave Search key)
+## Installed components
+
+The default package set includes chezmoi, GitHub CLI, Git LFS, jq, Secretive, and Obsidian. The optional runtime group is also selected by default and includes Docker Desktop, pnpm, Bun, and Python. Use `--skip runtimes` to omit that group.
+
+Secretive is installed automatically as a Homebrew cask. On first launch, create or select the signing key in Secretive; key creation and any Touch ID approval remain manual. The [Secretive Git guide](https://github.com/maxgoedjen/secretive-config-instructions/blob/main/apps/git.md) covers that step. Bootstrap configures `~/.ssh/config`, `~/.zshrc`, and Git to use Secretive, then verifies a signed commit in a temporary repository. When GitHub registration is needed, bootstrap shows the key fingerprint and account for review before adding any missing SSH authentication or commit-signing key. It requests the `write:public_key` and `write:ssh_signing_key` OAuth scopes as needed; see [GitHub’s SSH signing key API](https://docs.github.com/en/rest/users/ssh-signing-keys) and [SSH key API](https://docs.github.com/en/rest/users/keys).
+
+Git reads its signing key and allowed-signers path through `~/.gitconfig` and its included local configuration. Bootstrap keeps the selected public key and other machine-specific signing settings in local configuration, and adds the key to `~/.gitallowedsigners`. Each allowed-signers line follows [OpenSSH’s format](https://man.openbsd.org/ssh-keygen#ALLOWED_SIGNERS): the Git email followed by the public key type and key data, for example: `<git-email> ssh-ed25519 <base64-public-key>`. The path is configured as `~/.gitallowedsigners`; bootstrap also enables signature display in Git logs. If the older `~/.config/git/allowed_signers` exists, setup preserves it and carries its entries forward.
+
+## ArchiSteamFarm
+
+The bootstrap reuses an ASF passphrase already in the login Keychain. If no Keychain item exists, choose the optional Bitwarden importer or enter the passphrase manually with hidden input. `--no-bitwarden` selects manual entry. Bitwarden CLI is installed only when you choose its importer, and its vault still requires an interactive login and unlock.
+
+For the importer, create a Bitwarden Secure Note named `dotfiles: ASF backup` with one hidden custom field named `passphrase`. Put the **existing ASF backup passphrase** in that field; do not rotate it. The importer requires one exact note match and stops with instructions if the note is missing or duplicated. It does not save the Bitwarden master password or session. Dotfile rendering and shell startup do not require Bitwarden.
+
+Before enabling the ASF agents, setup downloads private copies of the available iCloud snapshots and verifies their hashes. It tests restoration in a staging directory and checks for usable configuration before loading either LaunchAgent. If there is no usable snapshot, setup remains pending until you install ASF, configure the bots, and complete Steam Guard; rerun `./bootstrap` afterward.
+
+The backup helper serializes setup and backup runs. It publishes a complete encrypted snapshot only after validation, then keeps the newest 14 snapshots. A failed credential read, encryption, or validation leaves existing snapshots intact. After setup, confirm that the ASF service is running and that a new encrypted snapshot appears in iCloud Drive.
+
+## Obsidian vault backups
+
+The bootstrap prepares the existing vault backup helper and detached Git history, then waits for any required Full Disk Access approval. Open and sign in to Obsidian, make sure the vault is readable and hydrated from iCloud, and grant the permission identified by the setup prompt. Synchronization is enabled only after the vault passes its safeguards, and setup remains pending until a backup cycle succeeds. Rerun `./bootstrap` to resume.
+
+## Updating the checkout
 
 ```sh
-bw login           # one-time, stores a session
-export BW_SESSION="$(bw unlock --raw)"
+cd "$HOME/.local/share/chezmoi"
+git pull --ff-only
+./bootstrap
 ```
 
-Create (or confirm you already have) the following vault item:
-
-| Item name      | Field   | Consumed by                                |
-| -------------- | ------- | ------------------------------------------ |
-| `Brave Search` | `token` | `~/.config/brave-search/env.sh` (API key)  |
-
-The template is **fault-tolerant**: a locked/missing vault renders an *empty* key instead of aborting `chezmoi apply`. So export `BW_SESSION` (unlocked) **before** applying if you want the key actually written; otherwise re-run `chezmoi apply` once the vault is unlocked.
-
-### 4. Provision the SSH signing key
-
-`.gitconfig` signs commits via SSH using the Secretive agent. The signer is a **hardware-backed key that requires a physical tap** — on this machine a Secure Enclave / Touch ID key via Secretive (`ecdsa-sha2-nistp256`); a Yubikey-resident key (often `ssh-ed25519`) works the same way.
-
-1. Open Secretive → create (or import) a signing key. For Secure-Enclave/Touch-ID signing it'll be an `ecdsa-sha2-nistp256` key; for a Yubikey use whatever the key provides (commonly `ed25519`).
-2. Add the **public** key to GitHub → Settings → SSH and GPG keys, type = **Signing Key**. Add it a second time as an **Authentication Key** if you want to use it for `git push` over SSH.
-3. Create `~/.config/git/allowed_signers` (not tracked here — sensitive-ish) with one line matching your key's type, e.g.:
-
-   ```
-   1764856+CTristan@users.noreply.github.com ecdsa-sha2-nistp256 AAAA…your-pubkey…
-   ```
-
-4. Optionally create `~/.config/git/config.local` for any machine-local overrides (the `[user] signingkey` path, work repos, etc.). It's pulled in via the `[include] path` at the bottom of `.gitconfig`.
-
-### 5. Install Oh My Zsh + the Dracula theme
-
-`.zshrc` expects Oh My Zsh at `$HOME/.oh-my-zsh`, with `ZSH_THEME="dracula"`.
-
-```sh
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
-git clone https://github.com/dracula/zsh.git ~/.oh-my-zsh/themes/dracula-src
-ln -s ~/.oh-my-zsh/themes/dracula-src/dracula.zsh-theme ~/.oh-my-zsh/themes/dracula.zsh-theme
-```
-
-### 6. Apply the dotfiles
-
-```sh
-chezmoi init --apply https://github.com/CTristan/dotfiles.git
-```
-
-This clones the repo to `~/.local/share/chezmoi`, renders the templates, and writes files into `$HOME`. Re-run `chezmoi apply` any time secrets or templates change.
-
-Sanity-check:
-
-```sh
-chezmoi doctor
-chezmoi diff        # should print nothing (env.sh may diff if BW_SESSION isn't set)
-```
-
-### 7. Set up ArchiSteamFarm (Apple silicon)
-
-`chezmoi apply` deploys the ASF setup helper, backup script, and two per-user LaunchAgents. It does not install ASF. The ASF backup passphrase is stored in Bitwarden.
-
-Before starting the backup agent, preserve the existing iCloud snapshots because its first run removes snapshots older than the newest 14. In Finder, open iCloud Drive → `ASF-Backups`, choose **Download Now**, and wait for the encrypted snapshots to finish downloading. Run this zsh snippet before the helper to make a private, timestamped copy and compare every snapshot's hash:
-
-```sh
-icloud="$HOME/Library/Mobile Documents/com~apple~CloudDocs/ASF-Backups"
-archive_root="$HOME/Library/Application Support/ASF Restore Archives"
-archive="$archive_root/$(date +%Y-%m-%d-%H%M%S)"
-mkdir -p "$archive_root" && chmod 700 "$archive_root" || exit 1
-mkdir "$archive" && chmod 700 "$archive" || exit 1
-snapshots=("$icloud"/asf-config-*.tar.gz.enc(N))
-(( ${#snapshots} > 0 )) || { echo "No downloaded ASF snapshots found" >&2; exit 1; }
-for snapshot in "${snapshots[@]}"; do
-  cp -p "$snapshot" "$archive/" || exit 1
-done
-for snapshot in "${snapshots[@]}"; do
-  name="${snapshot##*/}"
-  source_hash="$(shasum -a 256 "$snapshot" | awk '{print $1}')"
-  archive_hash="$(shasum -a 256 "$archive/$name" | awk '{print $1}')"
-  [ "$source_hash" = "$archive_hash" ] || { echo "SHA-256 mismatch: $name" >&2; exit 1; }
-done
-echo "Verified ${#snapshots} snapshots in $archive"
-```
-
-If a usable backup exists, run the helper after preserving the snapshots:
-
-```sh
-~/.local/bin/setup-asf
-```
-
-The helper downloads ASF's native `osx-arm64` build if it is missing; the build includes its .NET runtime, so no separate .NET installation is needed. If the passphrase is not already in your login Keychain, the helper prompts for it with terminal input hidden and stores it there. It restores the newest downloaded snapshot only when `~/Library/Application Support/ArchiSteamFarm/config/ASF.json` is absent, then loads both LaunchAgents. The ASF service starts in your user session. The backup agent runs immediately when the helper loads it (`RunAtLoad`), at login, and daily at 03:00 local time; it does not run while you are logged out. Its immediate `RunAtLoad` execution prunes snapshots older than the newest 14 during setup.
-
-If no usable backup exists, do not run the helper yet: it still loads both agents when no snapshot is present. Install the native ASF build using the [official setup guide](https://github.com/JustArchiNET/ArchiSteamFarm/wiki/Setting-up), create the global and bot configuration, and run ASF in the foreground to authenticate the bots with Steam. Complete any Steam Guard prompts locally, then stop the foreground ASF process before running the helper to prevent duplicate instances or IPC port conflicts. Once `config/ASF.json` exists, run `~/.local/bin/setup-asf`; it will skip restoration and load the agents.
-
-Verify the service and backup agents, then check each bot's Steam connection in the local ASF interface (usually `http://127.0.0.1:1242` when IPC is enabled):
-
-```sh
-launchctl print "gui/$(id -u)/com.user.archisteamfarm"
-launchctl print "gui/$(id -u)/com.user.asf-backup"
-```
-
-Confirm `~/Library/Logs/asf-backup.log` reports `done` and a new encrypted snapshot appears in iCloud Drive's `ASF-Backups` folder. To test a snapshot without printing or extracting its contents, set `snapshot` to its path and run this in zsh; replace the timestamp in the example filename. The passphrase is read without echo and is passed to OpenSSL through the environment, not as a command-line value:
-
-```sh
-snapshot="$HOME/Library/Mobile Documents/com~apple~CloudDocs/ASF-Backups/asf-config-YYYYMMDD-HHMMSS.tar.gz.enc"
-setopt pipefail
-read -rs 'PW?ASF backup passphrase: '
-export PW
-if /usr/bin/openssl enc -d -aes-256-cbc -pbkdf2 -pass env:PW -in "$snapshot" | tar -tzf - >/dev/null; then
-  echo "Snapshot integrity check passed"
-else
-  echo "Snapshot integrity check failed" >&2
-fi
-unset PW
-unsetopt pipefail
-```
-
-### 8. Clone the private Claude Code repo
-
-`~/.claude/` (and the `claude` shell wrapper that `.zshrc` defines) lives in the separate **private** repo, not in chezmoi:
-
-```sh
-git clone https://github.com/CTristan/dotclaude.git ~/.claude
-```
-
-The `claude()` function in `.zshrc` falls back to the real `claude` binary until this is present, so the shell won't break if you skip it.
-
-### 9. Install optional runtimes referenced by PATH
-
-`.zshrc` prepends these to PATH whether or not they exist. Install whichever you want:
-
-```sh
-brew install --cask docker           # adds ~/.docker/completions to fpath
-brew install pnpm                    # ~/Library/pnpm
-brew install oven-sh/bun/bun         # ~/.bun/bin
-brew install python                  # backs the `python=python3` alias
-```
-
-### 10. Verify
-
-- New shell: `exec zsh` — Dracula theme loads, no errors.
-- Git signing: `git -C some-repo commit --allow-empty -m test` — Secretive/Touch ID (or your Yubikey) prompts for a tap.
-- Brave API: `echo $BRAVE_API_KEY` in a fresh shell — set to the Bitwarden value (if the vault was unlocked at apply time).
-
-## Updating the dotfiles from another Mac
-
-```sh
-chezmoi cd          # enters ~/.local/share/chezmoi
-# …edit files, stage, commit, push…
-chezmoi apply       # re-renders templates locally
-```
-
-`[git] autoCommit = true` in `.chezmoi.toml.tmpl` means `chezmoi add` / `chezmoi edit` auto-commits; pushes are manual (`autoPush = false`).
+These commands use chezmoi’s default checkout path; use the path reported by setup if an existing checkout lives elsewhere. The bootstrap rechecks the actual installed state on each run and leaves local checkout changes in place.

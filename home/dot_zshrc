@@ -27,32 +27,14 @@ source "$ZSH/oh-my-zsh.sh"
 # Ensure personal scripts are available globally
 export PATH="$HOME/.local/bin:$PATH"
 
-# --- Brave Search ---
-if [ -f "$HOME/.config/brave-search/env.sh" ]; then
-  . "$HOME/.config/brave-search/env.sh"
-fi
-
 # --- Bun ---
 export PATH="$HOME/.bun/bin:$PATH"
-
-# --- Claude Code ---
-# Route `claude` through a wrapper that picks --model from cached quota pace.
-# Falls back to the real `claude` binary if the wrapper isn't present yet — e.g.
-# on a fresh machine before the private dotclaude repo is cloned into ~/.claude.
-claude() {
-  local wrapper="$HOME/.claude/scripts/claude-wrapper.sh"
-  if [[ -x "$wrapper" ]]; then
-    bash "$wrapper" "$@"
-  else
-    command claude "$@"
-  fi
-}
 
 # --- Docker ---
 fpath=("$HOME/.docker/completions" $fpath)
 
 # --- Pnpm ---
-export PNPM_HOME="/Users/chris/Library/pnpm"
+export PNPM_HOME="$HOME/Library/pnpm"
 case ":$PATH:" in
   *":$PNPM_HOME:"*) ;;
   *) export PATH="$PNPM_HOME:$PATH" ;;
@@ -64,15 +46,16 @@ alias python=python3
 
 
 # --- Secretive ---
-sock="$HOME/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh"
-[[ -S "$sock" ]] && export SSH_AUTH_SOCK="$sock"
+if [[ -S "$HOME/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh" ]]; then
+  export SSH_AUTH_SOCK="$HOME/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh"
+fi
 
 
 # Added by Antigravity CLI installer
-export PATH="/Users/chris/.local/bin:$PATH"
+export PATH="$HOME/.local/bin:$PATH"
 
 # Added by Antigravity IDE
-export PATH="/Users/chris/.antigravity-ide/antigravity-ide/bin:$PATH"
+export PATH="$HOME/.antigravity-ide/antigravity-ide/bin:$PATH"
 
 # >>> grok installer >>>
 export PATH="$HOME/.grok/bin:$PATH"
@@ -81,35 +64,5 @@ autoload -Uz compinit && compinit -C
 # <<< grok installer <<<
 
 # Added by LM Studio CLI (lms)
-export PATH="$PATH:/Users/chris/.lmstudio/bin"
+export PATH="$PATH:$HOME/.lmstudio/bin"
 # End of LM Studio CLI section
-
-
-# --- Claude subscription token ---
-# Reads the long-lived `claude setup-token` credential from the login keychain on
-# demand (service `agent-bench`, account `claude-token`). Deliberately a function
-# rather than an exported variable: an export would place a live subscription
-# credential in the environment of every process, including agent sessions that
-# execute generated code.
-claude-token() {
-  security find-generic-password -s agent-bench -a claude-token -w 2>/dev/null
-}
-
-# Runs a command with the subscription token in its environment and nowhere else:
-#   with-claude-token harbor run ...
-# The token travels as CLAUDE_CODE_OAUTH_TOKEN. Harbor normalises
-# ANTHROPIC_AUTH_TOKEN onto ANTHROPIC_API_KEY on the way into a container, so a
-# token under that name bills API credits instead of the subscription; agent-bench
-# refuses both names for that reason, in preflight and again before a batch.
-# ANTHROPIC_API_KEY is cleared for the child because it outranks the bearer token
-# in credential resolution.
-with-claude-token() {
-  local token
-  token="$(claude-token)"
-  if [[ -z "$token" ]]; then
-    print -u2 "with-claude-token: no token in keychain (service agent-bench, account claude-token)"
-    print -u2 "  run \`claude setup-token\`, then: security add-generic-password -s agent-bench -a claude-token -w"
-    return 1
-  fi
-  ANTHROPIC_API_KEY= ANTHROPIC_AUTH_TOKEN= CLAUDE_CODE_OAUTH_TOKEN="$token" "$@"
-}

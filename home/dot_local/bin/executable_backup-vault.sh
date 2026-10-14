@@ -44,6 +44,89 @@ g()      { git --git-dir="$GIT_DIR" --work-tree="$VAULT" "$@"; }
 # Best-effort desktop alert; must never kill the script (guarded + osascript optional).
 notify() { command -v osascript >/dev/null 2>&1 && osascript -e "display notification \"$1\" with title \"Vault sync\"" >/dev/null 2>&1 || true; }
 
+# Setup calls this through the fixed FDA-bearing helper before it loads the
+# LaunchAgent. Keep this branch ahead of the lock, log, hydration, and Git write
+# paths so it can report readiness without changing the vault or its history.
+check_preflight() {
+  local output rc md_count min_md git_worktree git_remote
+
+  if [[ ! -d "$VAULT" ]]; then
+    echo "preflight pending: vault directory is unavailable: $VAULT"
+    return 2
+  fi
+
+  if output=$(find "$VAULT" -name '*.icloud' -print -quit 2>&1); then
+    if [[ -n "$output" ]]; then
+      echo "preflight pending: iCloud placeholders remain; wait for the vault to hydrate, then rerun setup-vault-backup"
+      return 2
+    fi
+  else
+    rc=$?
+    if [[ "$output" == *"Operation not permitted"* || "$output" == *"Permission denied"* ]]; then
+      echo "preflight pending: the helper cannot read the vault; grant Full Disk Access to $HOME/.local/bin/vault-backup-helper in System Settings > Privacy & Security > Full Disk Access, then rerun setup-vault-backup"
+      return 2
+    fi
+    echo "preflight failed: cannot inspect iCloud placeholders (find exited $rc): $output"
+    return 1
+  fi
+
+  if output=$(find "$VAULT" -type f -name '*.md' -print 2>&1); then
+    if [[ -z "$output" ]]; then
+      md_count=0
+    else
+      md_count=$(printf '%s\n' "$output" | wc -l | tr -d ' ')
+    fi
+  else
+    rc=$?
+    if [[ "$output" == *"Operation not permitted"* || "$output" == *"Permission denied"* ]]; then
+      echo "preflight pending: the helper cannot read the vault; grant Full Disk Access to $HOME/.local/bin/vault-backup-helper in System Settings > Privacy & Security > Full Disk Access, then rerun setup-vault-backup"
+      return 2
+    fi
+    echo "preflight failed: cannot enumerate Markdown files (find exited $rc): $output"
+    return 1
+  fi
+
+  min_md="${VAULT_BACKUP_MIN_MD:-1000}"
+  if [[ "$min_md" != <-> ]]; then
+    echo "preflight failed: VAULT_BACKUP_MIN_MD must be a non-negative integer"
+    return 1
+  fi
+  if (( md_count < min_md )); then
+    echo "preflight pending: only $md_count Markdown files are readable (minimum $min_md); wait for the iCloud vault to hydrate before enabling sync"
+    return 2
+  fi
+
+  if [[ ! -d "$GIT_DIR" ]]; then
+    echo "preflight pending: detached Git history is not prepared: $GIT_DIR"
+    return 2
+  fi
+  if ! git --git-dir="$GIT_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
+    echo "preflight failed: detached Git history has no valid HEAD: $GIT_DIR"
+    return 1
+  fi
+  if ! git_worktree=$(git --git-dir="$GIT_DIR" config --get core.worktree 2>/dev/null) \
+    || [[ "$git_worktree" != "$VAULT" ]]; then
+    echo "preflight failed: detached Git history points at a different worktree"
+    return 1
+  fi
+  if ! git_remote=$(git --git-dir="$GIT_DIR" remote get-url origin 2>/dev/null) || [[ -z "$git_remote" ]]; then
+    echo "preflight failed: detached Git history has no origin remote"
+    return 1
+  fi
+
+  echo "preflight ready: vault is readable and hydrated ($md_count Markdown files); detached Git history is valid"
+  return 0
+}
+
+if (( $# > 0 )); then
+  if (( $# == 1 )) && [[ "$1" == "--check" ]]; then
+    check_preflight
+    exit $?
+  fi
+  echo "usage: backup-vault.sh [--check]" >&2
+  exit 1
+fi
+
 # Single-instance lock: kernel releases on process death — no stale-lock handling.
 zmodload zsh/system
 : >>"$LOCK_FILE"
